@@ -20,7 +20,7 @@ SUCH DAMAGE.
               Project: goldin
 	  Original Author: S.Sudre
              Creation: 05/27/2006
-    Last modification: 11/30/14
+    Last modification: 10/01/26
     
     +----------+-------------+---------------------------------------------------------+
     |   Date   |    Author   | Comments                                                |
@@ -61,6 +61,20 @@ SUCH DAMAGE.
     | 11/30/14 |   S.Sudre   | - Remove static state                                   |
     |          |             | - Fix text indentation                                  |
     +----------+-------------+---------------------------------------------------------+
+    | 10/01/26 | A.Staniforth| Version 0.0.8                                           |
+    |          |             |                                                         |
+    |          |             | - Accept more than one PATH                             |
+    |          |             | - Add long ('--') option flags                          |
+    |          |             | - Add -h/--help but keep -u                             |
+    |          |             | - Add --norecurse option                                |
+    |          |             | - Report errors that previously exited silently         |
+    |          |             | - Make error messages clearer and more consistent       |
+    |          |             | - Never strip a resource fork that was not copied       |
+    |          |             | - Report folders that cannot be read                    |
+    |          |             | - Delete a partial AppleDouble file after a write error |
+    |          |             | - Name the file in every error message                  |
+    |          |             | - Don't close the folder iterator twice                 |
+    +----------+-------------+---------------------------------------------------------+
     |          |             |                                                         |
     +----------+-------------+---------------------------------------------------------+
 
@@ -77,16 +91,19 @@ SUCH DAMAGE.
 
 #include <unistd.h>
 #include <getopt.h>
+#include <string.h>
+#include <errno.h>
 
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 
-#define GOLDIN_VERSION "0.0.7"
+#define GOLDIN_VERSION "0.0.8"
 
 long gMaxFileNameLength=0;
 Boolean gStripResourceForks=FALSE;
 Boolean gVerboseMode=FALSE;
+Boolean gNoRecurse=FALSE;
 
 /*#define DEBUG	1*/
 
@@ -119,6 +136,16 @@ Boolean gVerboseMode=FALSE;
 void SplitForks(FSRef * inItemReferencePtr);
 void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr);
 
+/* Get the POSIX path of an item for an error message */
+
+static const char * PathForErrorMessage(FSRef * inReferencePtr,UInt8 * outPath,UInt32 inMaxLength)
+{
+	if (FSRefMakePath(inReferencePtr,outPath,inMaxLength)!=noErr)
+		return "a file or directory";
+	
+	return (const char *) outPath;
+}
+
 OSErr SplitFileIfNeeded(FSRef * inFileReference,FSRef * inParentReference,FSCatalogInfo * inFileCatalogInfo,HFSUniStr255 * inFileName,Boolean * outDidSplit)
 {
 	OSErr tErr;
@@ -131,6 +158,7 @@ OSErr SplitFileIfNeeded(FSRef * inFileReference,FSRef * inParentReference,FSCata
 	UInt32 tPOSIXPathMaxLength=PATH_MAX*2;
 	struct stat tFileStat;
 	FSIORefNum tNewFileRefNum;
+	FSRef tNewFileReference;
 	
 	if (outDidSplit!=NULL)
         *outDidSplit=FALSE;
@@ -161,7 +189,7 @@ OSErr SplitFileIfNeeded(FSRef * inFileReference,FSRef * inParentReference,FSCata
 		
 		if (tErr!=noErr)
 		{
-			logerror("An error occurred on getting the resource fork size of a file or director\n");
+			logerror("An error occurred while getting the resource fork size of %s\n",PathForErrorMessage(inFileReference,tPOSIXPath,tPOSIXPathMaxLength));
 			
 			FSCloseFork(tForkRefNum);
 			
@@ -172,9 +200,9 @@ OSErr SplitFileIfNeeded(FSRef * inFileReference,FSRef * inParentReference,FSCata
 		{
 			FSCloseFork(tForkRefNum);
 			
-			/* AppleDouble File format does not support forks bigger than 2GB */
+			/* AppleDouble File format does not support forks bigger than 4GB */
 			
-			logerror("AppleDouble file format does not support forks bigger than 2 GB\n");
+			logerror("The resource fork of %s is too big for the AppleDouble file format (more than 4 GB)\n",PathForErrorMessage(inFileReference,tPOSIXPath,tPOSIXPathMaxLength));
 			
 			return -1;
 		}
@@ -204,7 +232,7 @@ OSErr SplitFileIfNeeded(FSRef * inFileReference,FSRef * inParentReference,FSCata
 				break;
 			default:
 				
-				logerror("Unable to open fork\n");
+				logerror("Unable to open the resource fork of %s (%d)\n",PathForErrorMessage(inFileReference,tPOSIXPath,tPOSIXPathMaxLength),tErr);
 				
 				return -1;
 				
@@ -270,7 +298,6 @@ OSErr SplitFileIfNeeded(FSRef * inFileReference,FSRef * inParentReference,FSCata
 	
 	if (tSplitNeeded==TRUE)
 	{
-		FSRef tNewFileReference;
 		HFSUniStr255 tNewFileName;
 	
 		/* Get the absolute Posix Path Name */
@@ -281,17 +308,7 @@ OSErr SplitFileIfNeeded(FSRef * inFileReference,FSRef * inParentReference,FSCata
 		{
 			if (lstat((char *) tPOSIXPath,&tFileStat)==-1)
 			{
-				switch(errno)
-				{
-					case ENOENT:
-						/* A COMPLETER */
-						
-						break;
-					default:
-						/* A COMPLETER */
-						
-						break;
-				}
+				logerror("Unable to get information about %s (%s)\n",tPOSIXPath,strerror(errno));
 				
 				tErr=-1;
 				
@@ -322,7 +339,7 @@ OSErr SplitFileIfNeeded(FSRef * inFileReference,FSRef * inParentReference,FSCata
 					
 			/* Write the error */
 			
-			logerror("File name is too long. The maximum length allowed is %ld characters\n",gMaxFileNameLength+2);
+			logerror("The name of %s is too long to add the ._ prefix (the maximum is %ld characters)\n",tPOSIXPath,gMaxFileNameLength);
 			
 			return -1;
 		}
@@ -351,18 +368,18 @@ tryagain:
 					
 					/* Write the error */
 					
-					logerror("File name is too long. The maximum length allowed is %ld characters\n",gMaxFileNameLength+2);
+					logerror("The name of %s is too long to add the ._ prefix (the maximum is %ld characters)\n",tPOSIXPath,gMaxFileNameLength);
 					
 					break;
 				case dskFulErr:
 					
-					logerror("Disk is full\n");
+					logerror("Unable to create the AppleDouble file of %s (the disk is full)\n",tPOSIXPath);
 					
 					break;
 					
 				case errFSQuotaExceeded:
 					
-					logerror("Your quota are exceeded\n");
+					logerror("Unable to create the AppleDouble file of %s (your disk quota has been exceeded)\n",tPOSIXPath);
 					
 					break;
 				case dupFNErr:
@@ -381,24 +398,28 @@ tryagain:
 						{
 							goto tryagain;
 						}
-						else
-						{
-							/* A COMPLETER */
-						}
 					}
-					else
-					{
-						/* A COMPLETER */
-					}
+					
+					logerror("Unable to replace the existing AppleDouble file of %s (%d)\n",tPOSIXPath,tErr);
 					
 					break;
 				
 				case afpVolLocked:
-					/* A COMPLETER */
+					
+					logerror("Unable to create the AppleDouble file of %s (the volume is locked)\n",tPOSIXPath);
+					
+					break;
+				
+				case afpAccessDenied:
+					
+					logerror("Unable to create the AppleDouble file of %s (permission denied)\n",tPOSIXPath);
+					
 					break;
 					
 				default:
-					/* A COMPLETER */
+					
+					logerror("Unable to create the AppleDouble file of %s (%d)\n",tPOSIXPath,tErr);
+					
 					break;
 			}
 			
@@ -527,7 +548,7 @@ tryagain:
 			{
 				/* **** Finder Info */
 			
-				tEntryLength=tResourceForkSize;	/* As you can see the AppleDouble format file is not ready for forks bigger than 2 GB */
+				tEntryLength=tResourceForkSize;	/* As you can see the AppleDouble format file is not ready for forks bigger than 4 GB */
 			}
 			else
 			{
@@ -733,13 +754,13 @@ tryagain:
                 // A COMPLETER
             }
             
-            /* Set the owner */
+            /* Copy the permissions (the owner and group are only copied when run as root) */
 			
 			tErr=FSSetCatalogInfo(&tNewFileReference,kFSCatInfoPermissions,inFileCatalogInfo);
 			
 			if (tErr!=noErr)
 			{
-				/*logerror("Permissions, owner and group could not be set for the AppleDouble file of %s\n",tPOSIXPath); */
+				logerror("Permissions, owner and group could not be set for the AppleDouble file of %s\n",tPOSIXPath);
 				
 				tErr=-1;
 				
@@ -748,7 +769,15 @@ tryagain:
 		}
 		else
 		{
-			/* A COMPLETER */
+			/* Report the error and stop: carrying on would strip (with --strip) a resource fork that was never copied */
+			
+			logerror("Unable to open the AppleDouble file of %s for writing (%d)\n",tPOSIXPath,tErr);
+			
+			FSDeleteObject(&tNewFileReference);
+			
+			tErr=-1;
+			
+			goto byebye;
 		}
 		
 		/* Close the Resource Fork if needed */
@@ -772,7 +801,7 @@ tryagain:
 							tErr=noErr;
 							break;
 						default:
-							/* A COMPLETER */
+							logerror("Resource fork could not be stripped from %s (%d)\n",tPOSIXPath,tErr);
 							break;
 					}
 				}
@@ -781,7 +810,7 @@ tryagain:
 			{
 				if (gStripResourceForks==TRUE && tErr!=noErr)
 				{
-					logerror("Resource Fork could not be stripped from %s\n",tPOSIXPath);
+					logerror("Resource fork could not be stripped from %s\n",tPOSIXPath);
 				
 					/* A COMPLETER */
 				}
@@ -796,17 +825,21 @@ writebail:
 	switch(tErr)
 	{
 		case dskFulErr:
-			logerror("Disk is full\n");
+			logerror("Unable to write the AppleDouble file of %s (the disk is full)\n",tPOSIXPath);
 			break;
 		case errFSQuotaExceeded:
-			logerror("Your quota are exceeded\n");
+			logerror("Unable to write the AppleDouble file of %s (your disk quota has been exceeded)\n",tPOSIXPath);
 			break;
 		default:
-			logerror("An unknown error occurred while writing the AppleDouble file of %s\n",tPOSIXPath);
+			logerror("An unknown error occurred while writing the AppleDouble file of %s (%d)\n",tPOSIXPath,tErr);
 			break;
 	}
 	
 	FSCloseFork(tNewFileRefNum);
+	
+	/* Don't leave a partial AppleDouble file behind */
+	
+	FSDeleteObject(&tNewFileReference);
 	
 byebye:
 
@@ -816,6 +849,30 @@ byebye:
 	}
 	
 	return tErr;
+}
+
+static void LogCatalogInfoError(FSRef * inReferencePtr,OSErr inErr)
+{
+	UInt8 tPath[PATH_MAX];
+	
+	if (FSRefMakePath(inReferencePtr,tPath,sizeof(tPath))==noErr)
+		logerror("An error occurred while getting the catalog information of %s (%d)\n",(char *) tPath,inErr);
+	else
+		logerror("An error occurred while getting the catalog information of a file or directory (%d)\n",inErr);
+}
+
+static void LogFolderReadError(FSRef * inReferencePtr,OSErr inErr)
+{
+	UInt8 tPath[PATH_MAX];
+	const char * tName="a directory";
+	
+	if (FSRefMakePath(inReferencePtr,tPath,sizeof(tPath))==noErr)
+		tName=(const char *) tPath;
+	
+	if (inErr==afpAccessDenied)
+		logerror("Unable to read the contents of %s (permission denied)\n",tName);
+	else
+		logerror("Unable to read the contents of %s (%d)\n",tName,inErr);
 }
 
 void SplitForks(FSRef * inItemReferencePtr)
@@ -855,7 +912,9 @@ void SplitForks(FSRef * inItemReferencePtr)
     }
     else
     {
-        logerror("An error occurred while getting Catalog Information for the File\n");
+        LogCatalogInfoError(inItemReferencePtr,tErr);
+        
+        exit(-1);
     }
 }
 
@@ -867,6 +926,8 @@ void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr)
 	
 	if (tErr==noErr)
 	{
+		Boolean tIteratorIsOpen=TRUE;
+		
 		FSRef * tFoundReferences=(FSRef *) malloc(sizeof(FSRef));
 		
 		do
@@ -896,8 +957,10 @@ void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr)
                             
                         if (tErr==noErr)
                         {
-                            if (tInfo.nodeFlags & kFSNodeIsDirectoryMask)
-                            {				
+                            /* With --norecurse, folders inside the path are split but not descended into */
+
+                            if ((tInfo.nodeFlags & kFSNodeIsDirectoryMask) && gNoRecurse==FALSE)
+                            {
                                 /* 2. We need to proceed with the contents of the folder */
                             
                                 SplitForksChildren(&tFoundReferences[0],inFileReferencePtr);
@@ -909,10 +972,14 @@ void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr)
                             {
                                 FSCloseIterator(tIterator);
                                 
+                                tIteratorIsOpen=FALSE;
+                                
                                 tErr=FSOpenIterator(inFileReferencePtr,kFSIterateFlat,&tIterator);
                                 
                                 if (tErr==noErr)
                                 {
+                                    tIteratorIsOpen=TRUE;
+                                    
                                     FSRef tPreviousCacheRef=tFoundReferences[0];
                                     
                                     do
@@ -941,7 +1008,9 @@ void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr)
                 }
                 else
                 {
-                    logerror("An error occurred while getting Catalog Information for the File\n");
+                    LogCatalogInfoError(&tFoundReferences[0],tErr);
+                    
+                    exit(-1);
                 }
 			}
 		}
@@ -949,7 +1018,8 @@ void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr)
 		
 		free(tFoundReferences);
 		
-		FSCloseIterator (tIterator);
+		if (tIteratorIsOpen==TRUE)
+			FSCloseIterator(tIterator);
 	}
 	
 	if (tErr!=noErr)
@@ -959,11 +1029,10 @@ void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr)
 			case errFSNoMoreItems:
 				/* No more items in the folder, this is perfectly ok */
 				break;
-			case afpAccessDenied:
-				break;
 			default:
-				/* A COMPLETER */
-		
+				/* Report the folder and carry on with the rest of the tree */
+				
+				LogFolderReadError(inFileReferencePtr,tErr);
 				break;
 		}
 	}
@@ -971,20 +1040,103 @@ void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr)
 
 static void usage(const char * inProcessName)
 {
-    printf("usage: %s [options] file ...\n",inProcessName);
+    printf("usage: %s [options] PATH ...\n", inProcessName);
     printf("\n"\
            "Options:\n"\
-           "  --help, -h           Show this usage guide\n"\
+           "  --help, -h, -u       Show this usage guide\n"\
            "  --verbose, -v        Verbose mode\n"\
            "  --strip, -s          Strip resource fork from source after splitting\n"\
+           "  --norecurse          Do not descend into subdirectories\n"\
            "  --version            Show the version of this tool\n"\
            "\n");
+}
+
+static int SplitPath(const char * inPath)
+{
+	char tResolvedPath[PATH_MAX];
+
+	if (realpath(inPath,tResolvedPath)!=NULL)
+	{
+		struct statfs tStatFileSystem;
+
+		if (statfs(tResolvedPath,&tStatFileSystem)!=0)
+		{
+			switch(errno)
+			{
+				case ENOENT:
+					/* No such file or directory */
+					
+					logerror("\"%s\" was not found\n",tResolvedPath);
+					break;
+				default:
+					logerror("Unable to get file system information for \"%s\" (%s)\n",inPath,strerror(errno));
+					break;
+			}
+
+			return -1;
+		}
+
+		if (strcmp(tStatFileSystem.f_fstypename,"hfs")!=0)
+		{
+			/* Return (-2) if this is not a HFS or Extended HFS File System */
+
+			logerror("\"%s\" is not on an hfs disk\n",inPath);
+
+			return 254;
+		}
+
+		gMaxFileNameLength=pathconf(tResolvedPath,_PC_NAME_MAX);
+
+		if (gMaxFileNameLength<0)
+		{
+			logerror("An error occurred while getting the maximum file name length for \"%s\" (%s)\n",inPath,strerror(errno));
+
+			return -1;
+		}
+
+		gMaxFileNameLength-=2;
+
+		FSRef tFileReference;
+		OSStatus tErr=FSPathMakeRef((const UInt8 *) tResolvedPath,&tFileReference,NULL);
+
+		if (tErr!=noErr)
+		{
+			logerror("An error occurred while getting the File System Reference of %s\n",inPath);
+
+			return -1;
+		}
+
+		if (gVerboseMode==TRUE)
+			printf("Splitting %s...\n",inPath);
+
+		SplitForks(&tFileReference);
+	}
+	else
+	{
+		switch(errno)
+		{
+			case ENOENT:
+				/* No such file or directory */
+
+				logerror("\"%s\" was not found\n",inPath);
+				break;
+			
+			default:
+				logerror("Unable to resolve the path \"%s\" (%s)\n",inPath,strerror(errno));
+				break;
+		}
+
+		return -1;
+	}
+
+	return 0;
 }
 
 int main (int argc, const char * argv[])
 {
     int c;
-	
+    int tIndex;
+
     while (1)
     {
         static struct option tLongOptions[] =
@@ -992,158 +1144,81 @@ int main (int argc, const char * argv[])
             {"help",                        no_argument,        NULL,    'h'},
             {"verbose",                     no_argument,        NULL,    'v'},
             {"strip",                       no_argument,        NULL,    's'},
+            {"norecurse",                   no_argument,        NULL,    0},
             {"version",                     no_argument,        NULL,    0},
-            
+
             {0, 0, 0, 0}
         };
-        
+
         int tOptionIndex = 0;
-        
-        c = getopt_long (argc, (char **) argv, "vhs",tLongOptions, &tOptionIndex);
-        
+
+        c = getopt_long (argc, (char **) argv, "hsuv",tLongOptions, &tOptionIndex);
+
         /* Detect the end of the options. */
         if (c == -1)
             break;
-        
+
         switch (c)
         {
             case 0:
-                
+
                 if (strncmp(tLongOptions[tOptionIndex].name,"version",strlen("version"))==0)
                 {
                     printf("%s\n",GOLDIN_VERSION);
-                    
+
                     exit(0);
+                }
+                else if (strncmp(tLongOptions[tOptionIndex].name,"norecurse",strlen("norecurse"))==0)
+                {
+                    gNoRecurse=TRUE;
                 }
 
                 break;
-                
+
             case 's':
-                
+
                 gStripResourceForks=TRUE;
-                
-                break;
-                
-            case 'v':
-                
-                gVerboseMode=TRUE;
-                
+
                 break;
 
-            case 'h':
-            default:
-                usage(argv[0]);
-                
-                exit(0);
-                
+            case 'v':
+
+                gVerboseMode=TRUE;
+
+                break;
+
+			case 'h':
+			case 'u':		/* -u is kept for backwards compatibility */
+				usage(argv[0]);
+				exit(0);
+
+			default:
+				usage(argv[0]);
+				exit(2);
+
                 break;
         }
     }
-	
+
 	argv+=optind;
     argc-=optind;
-    
-    if (argc != 1)
+
+    if (argc==0)
     {
-        if (argc==0) {
-            logerror("No file or directory was specified\n");
-    } else {
-            logerror("Only one file or directory may be specified\n");
-        }
+        logerror("No file or directory was specified\n");
+
 		return -1;
     }
-	else
+
+	/* Process each path in turn, stopping at the first one that fails */
+
+	for (tIndex=0;tIndex<argc;tIndex++)
 	{
-		char tResolvedPath[PATH_MAX];
-		
-		if (realpath(argv[0],tResolvedPath)!=NULL)
-		{
-			struct statfs tStatFileSystem;
-			
-			if (statfs(tResolvedPath,&tStatFileSystem)!=0)
-			{
-				switch(errno)
-				{
-					case ENOTDIR:
-						/* A COMPLETER */
-						break;
-					case ENAMETOOLONG:
-						/* A COMPLETER */
-						break;
-					case ENOENT:
-						/* No such file or directory */
-					
-						logerror("\"%s\" was not found\n",tResolvedPath);
-						break;
-					case EACCES:
-						/* A COMPLETER */
-						break;
-					case EIO:
-						/* A COMPLETER */
-						break;
-					default:
-						/* A COMPLETER */
-						break;
-				}
-				
-				return -1;
-			}
-			
-			if (strcmp(tStatFileSystem.f_fstypename,"hfs")!=0)
-			{
-				/* Return (-2) if this is not a HFS or Extended HFS File System */
-				
-				logerror("\"%s\" is not on an hfs disk\n",argv[0]);
-				
-				return 254;
-			}
-			
-			gMaxFileNameLength=pathconf(tResolvedPath,_PC_NAME_MAX);
-			
-			if (gMaxFileNameLength<0)
-			{
-				logerror("An error occurred while getting the File System Reference maximum length for a file name\n");
-				
-				return -1;
-			}
-			
-			gMaxFileNameLength-=2;
-			
-			FSRef tFileReference;
-			OSStatus tErr=FSPathMakeRef((const UInt8 *) tResolvedPath,&tFileReference,NULL);
-		
-			if (tErr!=noErr)
-			{
-				logerror("An error occurred while getting the File System Reference of %s\n",argv[0]);
-				
-				return -1;
-			}
-			
-			if (gVerboseMode==TRUE)
-				printf("Splitting %s...\n",argv[0]);
-			
-			SplitForks(&tFileReference);
-		}
-		else
-		{
-			switch(errno)
-			{
-				case ENOENT:
-					/* No such file or directory */
-					
-					logerror("\"%s\" was not found\n",argv[0]);
-					break;
-				
-				/* A COMPLETER */
-				
-				default:
-					/* A COMPLETER */
-					break;
-			}
-			
-			return -1;
-		}
+		int tStatus=SplitPath(argv[tIndex]);
+
+		if (tStatus!=0)
+			return tStatus;
 	}
-	
+
     return 0;
 }

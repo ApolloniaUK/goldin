@@ -1,53 +1,107 @@
-.\" Copyright (c) 2026, Stephane Sudre.
-.Dd September 17, 2026
+.\" Copyright (c) 2026, Alan Staniforth.
+.Dd October 1, 2026
 .Dt GOLDIN 1
-.Os "macOS"
+.Os
 .Sh NAME
-.Nm /usr/local/bin/goldin
-.Nd Divide an HFS/HFS+ file with 2 forks into a data fork and AppleDouble encoded resource fork.
+.Nm goldin
+.Nd Divide an HFS or HFS+ two-fork file into a data fork and an AppleDouble
+encoded resource fork
 .Sh SYNOPSIS
 .Nm
+.Op Fl h , Fl \-help , Fl u
+.Op Fl s , Fl \-strip
+.Op Fl v , Fl \-verbose
+.Op Fl \-norecurse
 .Op Fl \-version
-.Op Fl h , Fl \-help
-.Op Fl s , \-strip
-.Op Fl v , \-verbose
-.Ar FILE|DIRECTORY [FILE|DIRECTORY]...
+.Ar PATH ...
 .Sh DESCRIPTION
-Goldin does the same job as 
+Goldin does the same job as
 .Xr SplitForks 1
-with some enhanced functionality. It converts Macintosh HFS or HFS Extended 
-("HFS+") two-fork files into AppleDouble format with the data fork and the 
-resource fork plus file system metadata in separate files. The original 
-SplitForks only acted on one file, goldin can act on more than one file and 
-can also be invoked with one or more directories ans will search each 
-directory recursively for files to convert,
+with some enhanced functionality.
+It converts Macintosh HFS or HFS Extended ("HFS+") two-fork files into
+AppleDouble format with the data fork and the resource fork plus file system
+metadata in separate files.
+The original SplitForks only acted on one file.
+Goldin accepts one or more paths, and will search any directory passed to it
+recursively for files to convert, unless
+.Fl \-norecurse
+is given.
+.Pp
+Each
+.Ar PATH
+is split itself as well as its contents, so a folder with Finder information
+gets its own AppleDouble file alongside it, in its parent folder.
+.Pp
+Paths are processed in turn.
+Folders that cannot be read, including a
+.Ar PATH
+itself, are reported and skipped, and processing continues.
+Any other error is reported and stops goldin without processing the
+remaining paths.
 .Pp
 .Nm
 accepts these options and arguments:
 .Bl -tag -width -indent
-.It Fl \-version
-Show tool version and exit.
-.It Fl h , Fl \-help
-Show usage summary and exit.
+.It Fl h , Fl \-help , Fl u
+Print usage information and exit.
+.Fl u
+is kept for backwards compatibility.
 .It Fl s , Fl \-strip
-Strip the resource fork from the original file.  The default is to leave the resource file in place after copying it to its AppleDouble metadata file.
+Strip the resource fork from the original file.
+The default is to leave the resource fork in place after copying it to its
+AppleDouble metadata file.
 .It Fl v , Fl \-verbose
-.It Ar FILE|DIRECTORY ...
-The file to split.  
+Verbose mode.
+Prints to standard output when a file is to be split.
+.It Fl \-norecurse
+Only split the files and folders directly inside each
+.Ar PATH ;
+don't descend into its subdirectories.
+.It Fl \-version
+Print the tool's version and exit.
+.It Ar PATH ...
+One or more files or directories to split.
 .El
-.Pp
-.Sh FILE|DIRECTORY
+.Sh FILES
 .Bl -tag -width -indent
-.It example     - a file to convert
-.It example.d/  - a directoru to search for files0 to convert
+.It Pa /usr/local/bin/goldin
+The installed tool.
+.It example
+A file to convert.
+.It example.d/
+A directory to search for files to convert.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width Ds
+.It 0
+Success.
+.It 2
+An unknown option was given.
+.It 254
+A
+.Ar PATH
+is not on an HFS or HFS+ volume.
+.It 255
+Any other error, including no
+.Ar PATH
+being given.
 .El
 .Sh NOTES
-Goldin will fail with an error if the file(s) are not on an HFS/HFS+ volume
+Goldin will fail with an error if a file or directory is not on an HFS or
+HFS+ volume.
 .Pp
-Goldin lives here: https://github.com/packagesdev/goldin.
-.Sh SEE ALSO 
-.Xr SplitForks 1 , 
-.Xr FixupResourceForks 1 , 
-.Xr goldout 1 , 
+Unless goldin is run as root, the AppleDouble files it creates are owned by
+the user running it.
+Only the permissions of the original file are copied, not its owner or group.
+.Pp
+Goldin lives here:
+.Lk https://github.com/packagesdev/goldin .
+.Pp
+To know why this tool is named goldin, see
+.Lk https://en.wikipedia.org/wiki/Sawing_a_woman_in_half
+.Sh SEE ALSO
+.Xr FixupResourceForks 1 ,
+.Xr goldout 1 ,
+.Xr SplitForks 1
 .Sh STANDARDS
 RFC 1740 documents AppleSingle/AppleDouble formats.

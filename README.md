@@ -1,16 +1,58 @@
 ## Synopsis
 
-If you have been using SplitForks and FixupResourceForks to enable version
-control modern version control systems (Git &c) this stopped working when
-FixupResourceForks disappeared around about Sierra.
+Goldin: a modern replacement for SplitForks.
 
-Goldin is a replacement for SplitForks that does not require each target file
-specifying it just recursively process a directory tree - the same way goldout
-and FixupResourceForks do.
+## Motivation
+
+If you have been using SplitForks and FixupResourceForks to enable version
+control with modern version control systems (Git &c), this technique stopped
+working when FixupResourceForks disappeared in macOS Sierra.
+
+Goldin reimplements SplitForks (with a few enhancements) in case that
+should also go away.
+
+## Improvements over SplitForks
+
+- it can recursively process a directory tree, or with `--norecurse` just the
+  top level.
+- it accepts more than one path.
+- long options have been added and are called with `--`.
+- the source code is available.
+
+## Usage
+
+	$ goldin [options] PATH ...
+	
+	  Options:
+	  --help, -h, -u       Show this usage guide
+	  --verbose, -v        Verbose mode
+	  --strip, -s          Strip resource fork from source after splitting
+	  --norecurse          Do not descend into subdirectories
+	  --version            Show the version of this tool
+
+If passed a directory, Goldin will process it recursively. With `--norecurse`,
+only the files and folders directly inside it are split.
+
+Goldin accepts one or more paths and processes them in turn. Folders that cannot
+be read are reported and skipped; any other error stops Goldin.
+
+Goldin only works on HFS and HFS+ volumes. It exits with an error on APFS or any
+other file system.
+
+`-u` is kept as an alternative to `-h` for backwards compatibility.
+
+## Compatibility
+
+Minimum OS requirement is Mac OS X 10.8 at this time.
+
+## Tests
+
+Description forthcoming.
 
 ## License
 
 Copyright (c) 2006-2014, Stephane Sudre
+Portions copyright (c) 2026, Alan Staniforth
 All rights reserved.
  
 Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
