@@ -18,8 +18,14 @@ made by Alan Staniforth in September and October 2026.
   processes them in turn. It used to accept exactly one.
 - **`--norecurse`.** Splits the files and folders directly inside each `PATH`,
   but doesn't descend into subfolders.
+- **`-a` / `--apfs`.** Allows APFS volumes as well as HFS and HFS+. Without it,
+  goldin refuses APFS as before, now with a message suggesting `-a`. Other file
+  systems are always refused, because macOS keeps resource forks there in its
+  own `._` files, which goldin's AppleDouble files would collide with. Tested:
+  the AppleDouble files goldin writes on APFS are byte-for-byte identical to
+  those it writes on HFS+, and they convert back with goldout.
 - **Long options.** Every option can be given in long form with `--`:
-  `--help`, `--strip`, `--verbose`, `--norecurse` and `--version`.
+  `--help`, `--apfs`, `--strip`, `--verbose`, `--norecurse` and `--version`.
 - **Help options.** `-h` and `--help` show the usage guide. `-u` is kept as an
   alternative for backwards compatibility.
 - **Unreadable folders are reported and skipped.** They used to be skipped
@@ -28,7 +34,8 @@ made by Alan Staniforth in September and October 2026.
 - **Every error message names the file it is about**, and the messages are
   worded more consistently.
 - **Documented exit statuses:** 0 for success, 2 for an unknown option, 254 when
-  a `PATH` is not on an HFS or HFS+ volume, and 255 for any other error,
+  a `PATH` is not on a supported volume (HFS or HFS+, or with `-a` also APFS),
+  and 255 for any other error,
   including no `PATH`.
 - **Documentation.** New goldin(1) man page, an expanded README,
   and an updated change history in `main.c`.
@@ -98,9 +105,11 @@ made by Alan Staniforth in September and October 2026.
 - **goldin uses deprecated APIs.** It is built on the File Manager `FSRef`
   calls, which have been deprecated since Mac OS X 10.8.
   *Why:* replacing them would mean rewriting most of goldin.
-- **HFS and HFS+ only.** goldin refuses APFS and other file systems with
-  status 254.
-  *Why:* this is by design, as with SplitForks.
+- **HFS, HFS+ and (with `-a`) APFS only.** goldin refuses other file systems
+  with status 254.
+  *Why:* on those file systems macOS stores resource forks in its own `._`
+  files, which goldin's AppleDouble files would collide with. APFS needs `-a`
+  so that, by default, goldin behaves as SplitForks does.
 
 ---
 

@@ -1,14 +1,15 @@
 .\" Copyright (c) 2026, Alan Staniforth.
-.Dd October 1, 2026
+.Dd October 7, 2026
 .Dt GOLDIN 1
 .Os
 .Sh NAME
 .Nm goldin
-.Nd Divide an HFS or HFS+ two-fork file into a data fork and an AppleDouble
-encoded resource fork
+.Nd Divide a two-fork file into a data fork and an AppleDouble encoded
+resource fork
 .Sh SYNOPSIS
 .Nm
 .Op Fl h , Fl \-help , Fl u
+.Op Fl a , Fl \-apfs
 .Op Fl s , Fl \-strip
 .Op Fl v , Fl \-verbose
 .Op Fl \-norecurse
@@ -39,6 +40,15 @@ itself, are reported and skipped, and processing continues.
 Any other error is reported and stops goldin without processing the
 remaining paths.
 .Pp
+Like SplitForks, goldin only works on HFS and HFS+ volumes unless
+.Fl a
+is given, which allows APFS volumes as well.
+These file systems store resource forks and Finder information natively.
+Other file systems are always refused, because on those macOS keeps a file's
+resource fork and Finder information in its own
+.Ql \&._
+file, which the AppleDouble file goldin writes would collide with.
+.Pp
 .Nm
 accepts these options and arguments:
 .Bl -tag -width -indent
@@ -46,6 +56,8 @@ accepts these options and arguments:
 Print usage information and exit.
 .Fl u
 is kept for backwards compatibility.
+.It Fl a , Fl \-apfs
+Allow APFS volumes as well as HFS and HFS+.
 .It Fl s , Fl \-strip
 Strip the resource fork from the original file.
 The default is to leave the resource fork in place after copying it to its
@@ -80,7 +92,9 @@ An unknown option was given.
 .It 254
 A
 .Ar PATH
-is not on an HFS or HFS+ volume.
+is not on an HFS or HFS+ volume, or with
+.Fl a ,
+not on an HFS, HFS+ or APFS volume.
 .It 255
 Any other error, including no
 .Ar PATH
@@ -88,7 +102,9 @@ being given.
 .El
 .Sh NOTES
 Goldin will fail with an error if a file or directory is not on an HFS or
-HFS+ volume.
+HFS+ volume, or with
+.Fl a ,
+not on an HFS, HFS+ or APFS volume.
 .Pp
 Unless goldin is run as root, the AppleDouble files it creates are owned by
 the user running it.

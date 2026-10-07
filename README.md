@@ -16,6 +16,7 @@ should also go away.
 - it can recursively process a directory tree, or with `--norecurse` just the
   top level.
 - it accepts more than one path.
+- with `-a` or `--apfs`, it works on APFS volumes as well as HFS and HFS+.
 - long options have been added and are called with `--`.
 - the source code is available.
 
@@ -27,6 +28,7 @@ should also go away.
 	  --help, -h, -u       Show this usage guide
 	  --verbose, -v        Verbose mode
 	  --strip, -s          Strip resource fork from source after splitting
+	  --apfs, -a           Allow APFS volumes as well as HFS and HFS+
 	  --norecurse          Do not descend into subdirectories
 	  --version            Show the version of this tool
 
@@ -36,8 +38,11 @@ only the files and folders directly inside it are split.
 Goldin accepts one or more paths and processes them in turn. Folders that cannot
 be read are reported and skipped; any other error stops Goldin.
 
-Goldin only works on HFS and HFS+ volumes. It exits with an error on APFS or any
-other file system.
+Like SplitForks, Goldin only works on HFS and HFS+ volumes unless `-a` or
+`--apfs` is given, which allows APFS volumes as well. Other file systems are
+always refused: on those, macOS keeps a file's resource fork and Finder
+information in its own `._` file, which Goldin's AppleDouble file would collide
+with.
 
 `-u` is kept as an alternative to `-h` for backwards compatibility.
 

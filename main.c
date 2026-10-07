@@ -20,7 +20,7 @@ SUCH DAMAGE.
               Project: goldin
 	  Original Author: S.Sudre
              Creation: 05/27/2006
-    Last modification: 10/01/26
+    Last modification: 10/07/26
     
     +----------+-------------+---------------------------------------------------------+
     |   Date   |    Author   | Comments                                                |
@@ -67,6 +67,7 @@ SUCH DAMAGE.
     |          |             | - Add long ('--') option flags                          |
     |          |             | - Add -h/--help but keep -u                             |
     |          |             | - Add --norecurse option                                |
+    |          |             | - Add -a/--apfs to allow APFS volumes as well           |
     |          |             | - Report errors that previously exited silently         |
     |          |             | - Make error messages clearer and more consistent       |
     |          |             | - Never strip a resource fork that was not copied       |
@@ -104,6 +105,7 @@ long gMaxFileNameLength=0;
 Boolean gStripResourceForks=FALSE;
 Boolean gVerboseMode=FALSE;
 Boolean gNoRecurse=FALSE;
+Boolean gAllowAPFS=FALSE;
 
 /*#define DEBUG	1*/
 
@@ -1046,6 +1048,7 @@ static void usage(const char * inProcessName)
            "  --help, -h, -u       Show this usage guide\n"\
            "  --verbose, -v        Verbose mode\n"\
            "  --strip, -s          Strip resource fork from source after splitting\n"\
+           "  --apfs, -a           Allow APFS volumes as well as HFS and HFS+\n"\
            "  --norecurse          Do not descend into subdirectories\n"\
            "  --version            Show the version of this tool\n"\
            "\n");
@@ -1076,11 +1079,24 @@ static int SplitPath(const char * inPath)
 			return -1;
 		}
 
-		if (strcmp(tStatFileSystem.f_fstypename,"hfs")!=0)
-		{
-			/* Return (-2) if this is not a HFS or Extended HFS File System */
+		/* HFS, HFS+ and APFS store resource forks and Finder information natively. On other
+		   file systems macOS keeps them in its own ._ files, which the AppleDouble files
+		   goldin writes would collide with, so those are always refused. APFS is only
+		   accepted with --apfs, so that goldin otherwise behaves as SplitForks does. */
 
-			logerror("\"%s\" is not on an hfs disk\n",inPath);
+		Boolean tIsHFS=(strcmp(tStatFileSystem.f_fstypename,"hfs")==0);
+		Boolean tIsAPFS=(strcmp(tStatFileSystem.f_fstypename,"apfs")==0);
+
+		if (tIsHFS==FALSE && (tIsAPFS==FALSE || gAllowAPFS==FALSE))
+		{
+			/* Return (-2) if this is not a supported file system */
+
+			if (tIsAPFS==TRUE)
+				logerror("\"%s\" is on an APFS volume; use -a or --apfs to allow APFS\n",inPath);
+			else if (gAllowAPFS==TRUE)
+				logerror("\"%s\" is not on an HFS, HFS+ or APFS volume\n",inPath);
+			else
+				logerror("\"%s\" is not on an hfs disk\n",inPath);
 
 			return 254;
 		}
@@ -1144,6 +1160,7 @@ int main (int argc, const char * argv[])
             {"help",                        no_argument,        NULL,    'h'},
             {"verbose",                     no_argument,        NULL,    'v'},
             {"strip",                       no_argument,        NULL,    's'},
+            {"apfs",                        no_argument,        NULL,    'a'},
             {"norecurse",                   no_argument,        NULL,    0},
             {"version",                     no_argument,        NULL,    0},
 
@@ -1152,7 +1169,7 @@ int main (int argc, const char * argv[])
 
         int tOptionIndex = 0;
 
-        c = getopt_long (argc, (char **) argv, "hsuv",tLongOptions, &tOptionIndex);
+        c = getopt_long (argc, (char **) argv, "ahsuv",tLongOptions, &tOptionIndex);
 
         /* Detect the end of the options. */
         if (c == -1)
@@ -1178,6 +1195,12 @@ int main (int argc, const char * argv[])
             case 's':
 
                 gStripResourceForks=TRUE;
+
+                break;
+
+            case 'a':
+
+                gAllowAPFS=TRUE;
 
                 break;
 
