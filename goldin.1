@@ -10,8 +10,11 @@ resource fork
 .Nm
 .Op Fl h , Fl \-help , Fl u
 .Op Fl a , Fl \-apfs
+.Op Fl d , Fl \-dryrun
+.Op Fl l , Fl \-linksplit
 .Op Fl s , Fl \-strip
 .Op Fl v , Fl \-verbose
+.Op Fl w , Fl \-warnsymlink
 .Op Fl \-norecurse
 .Op Fl \-version
 .Ar PATH ...
@@ -32,6 +35,25 @@ Each
 .Ar PATH
 is split itself as well as its contents, so a folder with Finder information
 gets its own AppleDouble file alongside it, in its parent folder.
+.Pp
+Symbolic links inside a folder are neither split nor followed.
+A
+.Ar PATH
+that is a symbolic link is resolved first: its target is split, and the
+target's AppleDouble file goes alongside the target.
+With
+.Fl w ,
+goldin reports each item it splits this way.
+Files with more than one hard link are not split unless
+.Fl l
+is given.
+Goldin doesn't descend into volumes mounted inside a folder.
+The root of a volume can't be split itself, because its AppleDouble file
+would have to go in a folder on another volume.
+If a
+.Ar PATH
+is the root of a volume and has Finder information, goldin reports an error;
+otherwise its contents are split as usual.
 .Pp
 Paths are processed in turn.
 Folders that cannot be read, including a
@@ -58,6 +80,45 @@ Print usage information and exit.
 is kept for backwards compatibility.
 .It Fl a , Fl \-apfs
 Allow APFS volumes as well as HFS and HFS+.
+.It Fl d , Fl \-dryrun
+Check what goldin would do, without writing anything.
+Goldin lists every file and folder it would split, with their paths shown
+from where the path they all share ends, which the first line gives.
+Below an item, each problem goldin finds with it is shown on a line of its
+own, indented by four spaces and beginning
+.Ql WARNING:\& .
+Problems that would stop goldin end with
+.Ql goldin stops here ;
+the dry run carries on, so that every problem is listed.
+Goldin checks, without writing, that it can read the item's Finder
+information and resource fork, that the AppleDouble file's name and path are
+not too long, that the folder it goes in can be written to and is not locked,
+that any existing AppleDouble file can be replaced, and that the volume has
+room for all the AppleDouble files.
+Folders that can't be read are listed with a warning, as are
+.Ar PATH Ns s
+that can't be processed.
+With
+.Fl v ,
+goldin lists every item, including those it would not split, beginning
+each line with
+.Ql Process:\&
+or
+.Ql Ignored:\& ,
+and giving the reason an item would be ignored in parentheses.
+With
+.Fl w ,
+items reached through a symbolic link get a warning.
+.Fl s
+is ignored.
+.It Fl l , Fl \-linksplit
+Split files with more than one hard link as well.
+Each name of the file gets its own AppleDouble file.
+With
+.Fl s ,
+these files are split but their resource fork is not stripped: stripping it
+through one name would remove it from the file under all its names, and those
+elsewhere may have no AppleDouble file.
 .It Fl s , Fl \-strip
 Strip the resource fork from the original file.
 The default is to leave the resource fork in place after copying it to its
@@ -65,6 +126,15 @@ AppleDouble metadata file.
 .It Fl v , Fl \-verbose
 Verbose mode.
 Prints to standard output when a file is to be split.
+.It Fl w , Fl \-warnsymlink
+Report, on standard error, each item that is split, or split and stripped,
+after being reached through a symbolic link in a
+.Ar PATH
+as it was given: a
+.Ar PATH
+that is a symbolic link, or that goes through one.
+The report names the symbolic link.
+It does not change the exit status.
 .It Fl \-norecurse
 Only split the files and folders directly inside each
 .Ar PATH ;
@@ -87,6 +157,13 @@ A directory to search for files to convert.
 .Bl -tag -width Ds
 .It 0
 Success.
+With
+.Fl d ,
+no problems were found.
+.It 1
+With
+.Fl d ,
+problems were found.
 .It 2
 An unknown option was given.
 .It 254
@@ -109,6 +186,10 @@ not on an HFS, HFS+ or APFS volume.
 Unless goldin is run as root, the AppleDouble files it creates are owned by
 the user running it.
 Only the permissions of the original file are copied, not its owner or group.
+.Pp
+Files that macOS has compressed keep their compressed data in a hidden
+resource fork.
+That is not a real resource fork, and goldin leaves it alone.
 .Pp
 Goldin lives here:
 .Lk https://github.com/packagesdev/goldin .

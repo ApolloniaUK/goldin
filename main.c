@@ -76,36 +76,80 @@ SUCH DAMAGE.
     |          |             | - Name the file in every error message                  |
     |          |             | - Don't close the folder iterator twice                 |
     +----------+-------------+---------------------------------------------------------+
+    | 10/07/26 | A.Staniforth| Version 0.1.0                                           |
+    |          |             |                                                         |
+    |          |             | - Replace the deprecated File Manager (FSRef) calls     |
+    |          |             |   with getattrlist, getxattr, fts and POSIX file I/O    |
+    |          |             | - No longer use CoreServices                            |
+    |          |             | - Write the Finder Info as read: it is already in the   |
+    |          |             |   big-endian layout of the AppleDouble file             |
+    |          |             | - Report a full disk as "the disk is full"              |
+    |          |             | - Report resource fork read errors as such              |
+    |          |             | - Use a static copy buffer (no failed allocation)       |
+    |          |             | - Skip volumes mounted inside the folder tree           |
+    |          |             | - Add -l/--linksplit: split hard links (never stripped) |
+    |          |             | - Add -w/--warnsymlink: report items split through a    |
+    |          |             |   symbolic link                                         |
+    |          |             | - Add -d/--dryrun: list what would be split, and any    |
+    |          |             |   problems, without writing anything                    |
+    |          |             | - Report a volume root that needs splitting clearly     |
+    |          |             | - Fix the DEBUG build (logerror macro)                  |
+    +----------+-------------+---------------------------------------------------------+
     |          |             |                                                         |
     +----------+-------------+---------------------------------------------------------+
 
     Notes:
 
-    o "A COMPLETER" means "To be completed"
- 
     o To know why this tool is named goldin, see http://en.wikipedia.org/wiki/Sawing_a_woman_in_half
 		
     o This tool purpose is to be compatible with SplitForks and FixupResourceForks as best as possible. This explains why we have to create a Entry ID 2 even when it's not needed.
+
+    o The AppleDouble file written for an item (all numbers are big-endian):
+
+        0x00  Magic Number          0x00051607
+        0x04  Version Number        0x00020000
+        0x08  Filler                16 bytes of 0
+        0x18  Number of Entries     2
+        0x1A  Entry Descriptor      Finder Info: ID 9, offset 0x32, length 32
+        0x26  Entry Descriptor      Resource Fork: ID 2, offset 0x52, length = size of the resource fork (0 if none)
+        0x32  Finder Info           16 bytes of Finder Info, then 16 bytes of Extended Finder Info
+        0x52  Resource Fork
 */
 
-#include <CoreServices/CoreServices.h>
-
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <getopt.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <fts.h>
 
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/attr.h>
+#include <sys/xattr.h>
 
-#define GOLDIN_VERSION "0.0.8"
+#include <libkern/OSByteOrder.h>
+
+#define GOLDIN_VERSION "0.1.0"
 
 long gMaxFileNameLength=0;
-Boolean gStripResourceForks=FALSE;
-Boolean gVerboseMode=FALSE;
-Boolean gNoRecurse=FALSE;
-Boolean gAllowAPFS=FALSE;
+bool gStripResourceForks=false;
+bool gVerboseMode=false;
+bool gNoRecurse=false;
+bool gAllowAPFS=false;
+bool gSplitHardLinks=false;
+bool gWarnSymbolicLinks=false;
+bool gDryRun=false;
+
+/* With --warnsymlink: the first symbolic link in the PATH being processed, as it was given ("" if there is none) */
+
+char gSymbolicLink[PATH_MAX]="";
 
 /*#define DEBUG	1*/
 
@@ -114,7 +158,7 @@ Boolean gAllowAPFS=FALSE;
 #include <syslog.h>
 #include <stdarg.h>
 
-#define logerror(...) syslog(LOG_ERR, __VA_ARGS__);
+#define logerror(...) syslog(LOG_ERR, __VA_ARGS__)
 
 #else
 
@@ -122,922 +166,996 @@ Boolean gAllowAPFS=FALSE;
 
 #endif
 
-#define SWAP_RECT(inRect)   do {												\
-								(inRect).top=CFSwapInt16((inRect).top);			\
-								(inRect).left=CFSwapInt16((inRect).left);		\
-								(inRect).bottom=CFSwapInt16((inRect).bottom);	\
-								(inRect).right=CFSwapInt16((inRect).right);		\
-							} while (0);
-							
-#define SWAP_POINT(inPoint)   do {												\
-								(inPoint).h=CFSwapInt16((inPoint).h);			\
-								(inPoint).v=CFSwapInt16((inPoint).v);			\
-							} while (0);
+#define GOLDIN_FINDER_INFO_SIZE				32
 
+#define GOLDIN_NUMBER_OF_ENTRIES			2
 
-void SplitForks(FSRef * inItemReferencePtr);
-void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr);
+#define GOLDIN_HEADER_SIZE					(0x0000001A+GOLDIN_NUMBER_OF_ENTRIES*12)
 
-/* Get the POSIX path of an item for an error message */
+#define GOLDIN_BUFFER_ONE_MEGABYTE_SIZE		1048576
 
-static const char * PathForErrorMessage(FSRef * inReferencePtr,UInt8 * outPath,UInt32 inMaxLength)
+/* Get the Finder Info and the Extended Finder Info of an item and, for a file, the size of its resource fork */
+
+static int GetCatalogInfo(const char * inPath,bool inIsFile,uint8_t * outFinderInfo,off_t * outResourceForkSize)
 {
-	if (FSRefMakePath(inReferencePtr,outPath,inMaxLength)!=noErr)
-		return "a file or directory";
-	
-	return (const char *) outPath;
+	struct attrlist tAttributeList;
+	struct
+	{
+		uint32_t length;
+		uint8_t finderInfo[GOLDIN_FINDER_INFO_SIZE];
+		off_t resourceForkSize;
+	} __attribute__((aligned(4), packed)) tAttributeBuffer;
+
+	/* getattrlist, unlike getxattr, doesn't need permission to read the item (FSGetCatalogInfo didn't either), so a folder
+	   or a file without a resource fork is still split when it can't be read. The Finder Info comes in the big-endian
+	   layout of the AppleDouble file */
+
+	memset(&tAttributeList,0,sizeof(tAttributeList));
+	memset(&tAttributeBuffer,0,sizeof(tAttributeBuffer));
+
+	tAttributeList.bitmapcount=ATTR_BIT_MAP_COUNT;
+	tAttributeList.commonattr=ATTR_CMN_FNDRINFO;
+
+	/* Only files have a resource fork */
+
+	if (inIsFile==true)
+		tAttributeList.fileattr=ATTR_FILE_RSRCLENGTH;
+
+	if (getattrlist(inPath,&tAttributeList,&tAttributeBuffer,sizeof(tAttributeBuffer),FSOPT_NOFOLLOW)!=0)
+		return -1;
+
+	memcpy(outFinderInfo,tAttributeBuffer.finderInfo,GOLDIN_FINDER_INFO_SIZE);
+
+	*outResourceForkSize=tAttributeBuffer.resourceForkSize;
+
+	return 0;
 }
 
-OSErr SplitFileIfNeeded(FSRef * inFileReference,FSRef * inParentReference,FSCatalogInfo * inFileCatalogInfo,HFSUniStr255 * inFileName,Boolean * outDidSplit)
+/* Write a whole buffer to a file */
+
+static int WriteBuffer(int inFileDescriptor,const void * inBuffer,size_t inLength)
 {
-	OSErr tErr;
-	Boolean tSplitNeeded=FALSE;
-	FSIORefNum tForkRefNum;
-	UInt32 tResourceForkSize=0;
-	static HFSUniStr255 sResourceForkName={0,{}};
-	Boolean tHasResourceFork=FALSE;
-	UInt8 tPOSIXPath[PATH_MAX*2+1];
-	UInt32 tPOSIXPathMaxLength=PATH_MAX*2;
-	struct stat tFileStat;
-	FSIORefNum tNewFileRefNum;
-	FSRef tNewFileReference;
-	
-	if (outDidSplit!=NULL)
-        *outDidSplit=FALSE;
-    
-    if (sResourceForkName.length==0)
+	const uint8_t * tBytes=(const uint8_t *) inBuffer;
+
+	while (inLength>0)
 	{
-		tErr=FSGetResourceForkName(&sResourceForkName);
-	
-		if (tErr!=noErr)
+		ssize_t tWrittenCount=write(inFileDescriptor,tBytes,inLength);
+
+		if (tWrittenCount<0)
 		{
-			logerror("An error occurred when obtaining the ResourceFork name\n");
+			if (errno==EINTR)
+				continue;
 			
 			return -1;
 		}
+
+		tBytes+=tWrittenCount;
+		inLength-=(size_t) tWrittenCount;
+	}
+
+	return 0;
+}
+
+/* --dryrun: what would happen to each item, listed once every PATH has been checked */
+
+typedef struct
+{
+	char * path;
+	bool process;			/* The item would be split */
+	const char * reason;	/* Why it would be ignored */
+	char * warnings;		/* Its "WARNING: " lines */
+} DryRunEntry;
+
+typedef struct
+{
+	dev_t device;
+	long long freeSize;
+	long long neededSize;
+	long long blockSize;
+} DryRunVolume;
+
+#define GOLDIN_DRY_RUN_MAX_VOLUMES			32
+
+static DryRunEntry * gDryRunEntries=NULL;
+static size_t gDryRunEntriesCount=0;
+static size_t gDryRunEntriesCapacity=0;
+static bool gDryRunFoundProblems=false;
+static DryRunVolume gDryRunVolumes[GOLDIN_DRY_RUN_MAX_VOLUMES];
+static size_t gDryRunVolumesCount=0;
+
+static void * DryRunAllocate(void * inPointer,size_t inSize)
+{
+	void * tPointer=realloc(inPointer,inSize);
+
+	if (tPointer==NULL)
+	{
+		logerror("There is not enough memory for the dry run\n");
+
+		exit(-1);
+	}
+
+	return tPointer;
+}
+
+static void DryRunAddItem(const char * inPath,bool inProcess,const char * inReason)
+{
+	DryRunEntry * tEntry;
+
+	if (gDryRunEntriesCount==gDryRunEntriesCapacity)
+	{
+		gDryRunEntriesCapacity=(gDryRunEntriesCapacity==0) ? 256 : gDryRunEntriesCapacity*2;
+
+		gDryRunEntries=DryRunAllocate(gDryRunEntries,gDryRunEntriesCapacity*sizeof(DryRunEntry));
+	}
+
+	tEntry=&gDryRunEntries[gDryRunEntriesCount++];
+
+	tEntry->path=DryRunAllocate(NULL,strlen(inPath)+1);
+	strcpy(tEntry->path,inPath);
+
+	tEntry->process=inProcess;
+	tEntry->reason=inReason;
+	tEntry->warnings=NULL;
+}
+
+/* The latest entry for an item (a folder is met again once its contents have been read) */
+
+static DryRunEntry * DryRunFindItem(const char * inPath)
+{
+	size_t i=gDryRunEntriesCount;
+
+	while (i>0)
+	{
+		i--;
+
+		if (strcmp(gDryRunEntries[i].path,inPath)==0)
+			return &gDryRunEntries[i];
+	}
+
+	DryRunAddItem(inPath,false,NULL);
+
+	return &gDryRunEntries[gDryRunEntriesCount-1];
+}
+
+static void DryRunProcessItem(const char * inPath)
+{
+	DryRunFindItem(inPath)->process=true;
+}
+
+static void DryRunWarn(const char * inPath,const char * inFormat,...) __attribute__((format(printf,2,3)));
+
+static void DryRunWarn(const char * inPath,const char * inFormat,...)
+{
+	static const char sPrefix[]="    WARNING: ";
+	DryRunEntry * tEntry=DryRunFindItem(inPath);
+	size_t tOldLength=(tEntry->warnings==NULL) ? 0 : strlen(tEntry->warnings);
+	va_list tArguments;
+	int tLength;
+
+	va_start(tArguments,inFormat);
+	tLength=vsnprintf(NULL,0,inFormat,tArguments);
+	va_end(tArguments);
+
+	if (tLength<0)
+		return;
+
+	tEntry->warnings=DryRunAllocate(tEntry->warnings,tOldLength+sizeof(sPrefix)+(size_t) tLength+1);
+
+	memcpy(tEntry->warnings+tOldLength,sPrefix,sizeof(sPrefix)-1);
+
+	va_start(tArguments,inFormat);
+	vsnprintf(tEntry->warnings+tOldLength+sizeof(sPrefix)-1,(size_t) tLength+1,inFormat,tArguments);
+	va_end(tArguments);
+
+	strcat(tEntry->warnings+tOldLength,"\n");
+
+	gDryRunFoundProblems=true;
+}
+
+/* The length of a name as the file system counts it. HFS+ and APFS both allow 255 UTF-16 units, counted in the form
+   the name is stored in (decomposed on HFS+), which is the form it is read back in */
+
+static size_t DryRunNameLength(const char * inName)
+{
+	const unsigned char * tByte;
+	size_t tLength=0;
+
+	for (tByte=(const unsigned char *) inName;*tByte!='\0';tByte++)
+	{
+		/* Count the first byte of each character; those outside the BMP need 2 UTF-16 units */
+
+		if ((*tByte & 0xC0)!=0x80)
+			tLength+=(*tByte>=0xF0) ? 2 : 1;
+	}
+
+	return tLength;
+}
+
+/* Add an AppleDouble file to the space its volume needs, and check that it still fits */
+
+static bool DryRunSpaceFits(const char * inFolder,dev_t inDevice,long long inSize,long long inReplacedSize,long long * outNeededSize,long long * outFreeSize)
+{
+	DryRunVolume * tVolume=NULL;
+	size_t i;
+
+	for (i=0;i<gDryRunVolumesCount;i++)
+	{
+		if (gDryRunVolumes[i].device==inDevice)
+			tVolume=&gDryRunVolumes[i];
+	}
+
+	if (tVolume==NULL)
+	{
+		struct statfs tStatFileSystem;
+
+		if (gDryRunVolumesCount==GOLDIN_DRY_RUN_MAX_VOLUMES || statfs(inFolder,&tStatFileSystem)!=0 || tStatFileSystem.f_bsize==0)
+			return true;		/* We can't tell */
+
+		tVolume=&gDryRunVolumes[gDryRunVolumesCount++];
+
+		tVolume->device=inDevice;
+		tVolume->freeSize=(long long) tStatFileSystem.f_bavail*(long long) tStatFileSystem.f_bsize;
+		tVolume->neededSize=0;
+		tVolume->blockSize=(long long) tStatFileSystem.f_bsize;
+	}
+
+	/* A file takes whole allocation blocks, and the space of a ._ file it replaces is reused */
+
+	tVolume->neededSize+=((inSize+tVolume->blockSize-1)/tVolume->blockSize)*tVolume->blockSize-inReplacedSize;
+
+	*outNeededSize=tVolume->neededSize;
+	*outFreeSize=tVolume->freeSize;
+
+	return (tVolume->neededSize<=tVolume->freeSize);
+}
+
+/* Check, without writing anything, that the AppleDouble file of an item could be written */
+
+static void DryRunCheckAppleDoubleFile(const char * inPath,const struct stat * inFileStat,const char * inFileName,const char * inAppleDoublePath,uint32_t inResourceForkSize)
+{
+	char tFolder[PATH_MAX];
+	struct stat tFolderStat;
+	struct stat tAppleDoubleStat;
+	bool tHasFolderStat;
+	long long tReplacedSize=0;
+	long long tNeededSize;
+	long long tFreeSize;
+
+	/* With --warnsymlink, report items reached through a symbolic link */
+
+	if (gWarnSymbolicLinks==true && gSymbolicLink[0]!='\0')
+		DryRunWarn(inPath,"it is reached through the symbolic link \"%s\"",gSymbolicLink);
+
+	/* The name must leave room for the ._ prefix */
+
+	if ((long) DryRunNameLength(inFileName)>gMaxFileNameLength)
+		DryRunWarn(inPath,"its name is too long to add the ._ prefix (the maximum is %ld characters); goldin stops here",gMaxFileNameLength);
+
+	/* The AppleDouble file is created in the item's folder */
+
+	snprintf(tFolder,sizeof(tFolder),"%.*s",(int) (inFileName-inPath),inPath);
+
+	tHasFolderStat=(lstat(tFolder,&tFolderStat)==0);
+
+	if (tHasFolderStat==true && (tFolderStat.st_flags & (UF_IMMUTABLE|SF_IMMUTABLE))!=0)
+	{
+		DryRunWarn(inPath,"its AppleDouble file can't be created (the folder is locked); goldin stops here");
+	}
+	else if (access(tFolder,W_OK|X_OK)!=0)
+	{
+		switch(errno)
+		{
+			case EACCES:
+				DryRunWarn(inPath,"its AppleDouble file can't be created (permission denied); goldin stops here");
+				break;
+			case EROFS:
+				DryRunWarn(inPath,"its AppleDouble file can't be created (the volume is locked); goldin stops here");
+				break;
+			default:
+				DryRunWarn(inPath,"its AppleDouble file can't be created (%s); goldin stops here",strerror(errno));
+				break;
+		}
+	}
+
+	/* An existing ._ file is replaced */
+
+	if (lstat(inAppleDoublePath,&tAppleDoubleStat)==0)
+	{
+		if (S_ISDIR(tAppleDoubleStat.st_mode))
+			DryRunWarn(inPath,"a folder named ._%s is in the way of its AppleDouble file; goldin stops here",inFileName);
+		else if ((tAppleDoubleStat.st_flags & (UF_IMMUTABLE|SF_IMMUTABLE))!=0)
+			DryRunWarn(inPath,"its existing AppleDouble file is locked, so it can't be replaced; goldin stops here");
+		else if (tHasFolderStat==true && (tFolderStat.st_mode & S_ISVTX)!=0 && geteuid()!=0 && tAppleDoubleStat.st_uid!=geteuid() && tFolderStat.st_uid!=geteuid())
+			DryRunWarn(inPath,"its existing AppleDouble file belongs to another user in a sticky folder, so it can't be replaced; goldin stops here");
+		else
+			tReplacedSize=(long long) tAppleDoubleStat.st_blocks*512;
+	}
+
+	/* Check there is room for it */
+
+	if (DryRunSpaceFits(tFolder,inFileStat->st_dev,(long long) GOLDIN_HEADER_SIZE+GOLDIN_FINDER_INFO_SIZE+inResourceForkSize,tReplacedSize,&tNeededSize,&tFreeSize)==false)
+		DryRunWarn(inPath,"there may not be enough free space for its AppleDouble file (%lld KB needed on the volume so far, %lld KB free); goldin would stop with \"the disk is full\"",tNeededSize/1024,tFreeSize/1024);
+}
+
+static bool DryRunIsListed(const DryRunEntry * inEntry)
+{
+	return (gVerboseMode==true || inEntry->process==true || inEntry->warnings!=NULL);
+}
+
+/* List what would be done, with the paths shown from where the path common to all of them ends */
+
+static int DryRunList(void)
+{
+	const char * tCommonPath=NULL;
+	size_t tCommonLength=0;
+	size_t i;
+
+	for (i=0;i<gDryRunEntriesCount;i++)
+	{
+		const char * tPath=gDryRunEntries[i].path;
+		size_t tLimit=strlen(tPath);
+		size_t k=0;
+
+		if (DryRunIsListed(&gDryRunEntries[i])==false || tLimit==0)
+			continue;
+
+		if (tCommonPath==NULL)
+		{
+			tCommonPath=tPath;
+			tCommonLength=tLimit;
+		}
+
+		/* The common path ends with a '/', and every path goes on after it */
+
+		while (k<tCommonLength && k<tLimit-1 && tPath[k]==tCommonPath[k])
+			k++;
+
+		while (k>0 && tCommonPath[k-1]!='/')
+			k--;
+
+		tCommonLength=k;
+	}
+
+	if (tCommonPath==NULL)
+	{
+		printf("Dry run, nothing written. Nothing would be split.\n");
+
+		return 0;
+	}
+
+	if (tCommonLength>0)
+		printf("Dry run, nothing written. Paths are relative to %.*s\n",(int) tCommonLength,tCommonPath);
+	else
+		printf("Dry run, nothing written.\n");
+
+	for (i=0;i<gDryRunEntriesCount;i++)
+	{
+		const DryRunEntry * tEntry=&gDryRunEntries[i];
+
+		if (DryRunIsListed(tEntry)==false || strlen(tEntry->path)==0)
+			continue;
+
+		if (gVerboseMode==true)
+		{
+			printf("%s%s",(tEntry->process==true) ? "Process: " : "Ignored: ",tEntry->path+tCommonLength);
+
+			if (tEntry->process==false && tEntry->reason!=NULL)
+				printf(" (%s)",tEntry->reason);
+
+			printf("\n");
+		}
+		else
+		{
+			printf("%s\n",tEntry->path+tCommonLength);
+		}
+
+		if (tEntry->warnings!=NULL)
+			fputs(tEntry->warnings,stdout);
+	}
+
+	return (gDryRunFoundProblems==true) ? 1 : 0;
+}
+
+/* --warnsymlink: find the first symbolic link in a path as it was given */
+
+static void FindSymbolicLink(const char * inPath,char * outSymbolicLink,size_t inMaxLength)
+{
+	size_t tLength=strlen(inPath);
+	size_t i;
+
+	outSymbolicLink[0]='\0';
+
+	if (tLength>=inMaxLength)
+		return;
+
+	for (i=1;i<=tLength;i++)
+	{
+		if (i==tLength || inPath[i]=='/')
+		{
+			struct stat tStat;
+
+			memcpy(outSymbolicLink,inPath,i);
+			outSymbolicLink[i]='\0';
+
+			if (lstat(outSymbolicLink,&tStat)==0 && S_ISLNK(tStat.st_mode))
+				return;
+		}
+	}
+
+	outSymbolicLink[0]='\0';
+}
+
+int SplitFileIfNeeded(const char * inPath,const struct stat * inFileStat)
+{
+	bool tSplitNeeded=false;
+	bool tIsHardLink=(S_ISREG(inFileStat->st_mode) && inFileStat->st_nlink>1);
+	bool tStripped=false;
+	off_t tForkSize;
+	uint32_t tResourceForkSize=0;
+	uint8_t tFinderInfo[GOLDIN_FINDER_INFO_SIZE];
+	uint8_t tHeader[GOLDIN_HEADER_SIZE+GOLDIN_FINDER_INFO_SIZE];
+	const char * tFileName;
+	char tAppleDoublePath[PATH_MAX];
+	struct statfs tStatFileSystem;
+	int tNewFileDescriptor;
+	int tErrno;
+	int i;
+
+	if (gDryRun==true)
+		DryRunAddItem(inPath,false,"nothing to split");
+
+	if (GetCatalogInfo(inPath,S_ISREG(inFileStat->st_mode),tFinderInfo,&tForkSize)!=0)
+	{
+		tErrno=errno;
+
+		if (gDryRun==true)
+		{
+			DryRunProcessItem(inPath);
+			DryRunWarn(inPath,"its catalog information can't be read (%s); goldin stops here",strerror(tErrno));
+
+			return 0;
+		}
+
+		logerror("An error occurred while getting the catalog information of %s (%s)\n",inPath,strerror(tErrno));
+
+		return -1;
 	}
 	
 	/* 1. Check for the presence of a resource fork */
 		
-	tErr=FSOpenFork(inFileReference,sResourceForkName.length,sResourceForkName.unicode,fsRdPerm,&tForkRefNum);
-	
-	if (tErr==noErr)
+	if (tForkSize>0)
 	{
-		SInt64 tForkSize;
-		
-		/* Get the size of the resource fork */
-		
-		tErr=FSGetForkSize(tForkRefNum,&tForkSize);
-		
-		if (tErr!=noErr)
-		{
-			logerror("An error occurred while getting the resource fork size of %s\n",PathForErrorMessage(inFileReference,tPOSIXPath,tPOSIXPathMaxLength));
-			
-			FSCloseFork(tForkRefNum);
-			
-			return -1;
-		}
-		
-		if (tForkSize>0xFFFFFFFF)
-		{
-			FSCloseFork(tForkRefNum);
-			
-			/* AppleDouble File format does not support forks bigger than 4GB */
-			
-			logerror("The resource fork of %s is too big for the AppleDouble file format (more than 4 GB)\n",PathForErrorMessage(inFileReference,tPOSIXPath,tPOSIXPathMaxLength));
-			
-			return -1;
-		}
-		
-		tResourceForkSize=(UInt32) tForkSize;
-		
-		if (tForkSize>0)
-		{
-			tHasResourceFork=TRUE;
-		
-			tSplitNeeded=TRUE;
-		}
-		else
-		{
-			FSCloseFork(tForkRefNum);
-		}
-	}
-	else
-	{
-		switch(tErr)
-		{
-			case errFSForkNotFound:
-			case eofErr:
-				/* No resource Fork */
-				
-				tErr=noErr;
-				break;
-			default:
-				
-				logerror("Unable to open the resource fork of %s (%d)\n",PathForErrorMessage(inFileReference,tPOSIXPath,tPOSIXPathMaxLength),tErr);
-				
-				return -1;
-				
-				break;
-		}
-	}
-	
-	/* 2. Check for the presence of FinderInfo or ExtFinderInfo */
-	
-	if (tSplitNeeded==FALSE)
-	{
-		UInt32 * tUnsignedInt32Ptr;
-		int i;
-		
-		
-		/* 1. We need to save the Folder(Ext) Info in the ._ file if there are any folder/finder or extend folder/finder info */
-			
-		tUnsignedInt32Ptr= (UInt32 *) inFileCatalogInfo->finderInfo;
-		
-		for(i=0;i<4;i++)
-		{
-			if (tUnsignedInt32Ptr[i]!=0)
-			{
-				/* We need to create a ._file */
-			
-				tSplitNeeded=TRUE;
-				break;
-			}
-		}
-		
-		if (tSplitNeeded==TRUE)		/* 01/02/07: Symbolic link looks like this */
-		{
-			UInt32 tSymbolicLink;
+		/* Get the size of the resource fork (this also checks that it can be read) */
 
-			tSymbolicLink='s';
-			tSymbolicLink='l'+(tSymbolicLink<<8);
-			tSymbolicLink='n'+(tSymbolicLink<<8);
-			tSymbolicLink='k'+(tSymbolicLink<<8);
+		ssize_t tReadableForkSize=getxattr(inPath,XATTR_RESOURCEFORK_NAME,NULL,0,0,XATTR_NOFOLLOW);
 
-			if (tUnsignedInt32Ptr[0]==tSymbolicLink)
+		if (tReadableForkSize<0)
+		{
+			switch(errno)
 			{
-				tSplitNeeded=FALSE;
-			}
-		}
-		else
-		{
-			tUnsignedInt32Ptr= (UInt32 *) inFileCatalogInfo->extFinderInfo;
-		
-			for(i=0;i<4;i++)
-			{
-				if (tUnsignedInt32Ptr[i]!=0)
-				{
-					/* We need to create a ._file */
-				
-					tSplitNeeded=TRUE;
-					break;
-				}
-			}
-		}
-	}
-	
-	/* 3. Split if needed */
-	
-	if (tSplitNeeded==TRUE)
-	{
-		HFSUniStr255 tNewFileName;
-	
-		/* Get the absolute Posix Path Name */
-		
-		tErr=FSRefMakePath(inFileReference,tPOSIXPath,tPOSIXPathMaxLength);
-		
-		if (tErr==noErr)
-		{
-			if (lstat((char *) tPOSIXPath,&tFileStat)==-1)
-			{
-				logerror("Unable to get information about %s (%s)\n",tPOSIXPath,strerror(errno));
-				
-				tErr=-1;
-				
-				goto byebye;
-			}
-		}
-		else
-		{
-			logerror("An error occurred when trying to get the absolute path of a file or directory\n");
-			
-			tErr=-1;
-				
-			goto byebye;
-		}
-		
-		if (gVerboseMode==TRUE)
-		{
-			printf("    splitting %s...\n",tPOSIXPath);
-		}
-		
-		/* Check that we do not explode the current limit for file names */
-		
-		if (inFileName->length>gMaxFileNameLength)
-		{
-			/* We do not have enough space to add the ._ prefix */
-		
-			/* The file name is too long */
-					
-			/* Write the error */
-			
-			logerror("The name of %s is too long to add the ._ prefix (the maximum is %ld characters)\n",tPOSIXPath,gMaxFileNameLength);
-			
-			return -1;
-		}
-		
-		tNewFileName.length=inFileName->length+2;
-		
-		tNewFileName.unicode[0]='.';
-		tNewFileName.unicode[1]='_';
-		
-		memcpy(tNewFileName.unicode+2,inFileName->unicode,inFileName->length*sizeof(UniChar));
-		
-		/* We need to create a ._file */
-		
-tryagain:
+				case ENOATTR:
+					/* No resource Fork (any more) */
 
-		tErr=FSCreateFileUnicode(inParentReference,tNewFileName.length,tNewFileName.unicode,0,NULL,&tNewFileReference,NULL);
-		
-		if (tErr!=noErr)
-		{
-			switch(tErr)
-			{
-				case bdNamErr:
-				case fsmBadFFSNameErr:
-				case errFSNameTooLong:
-					/* The file name is too long */
-					
-					/* Write the error */
-					
-					logerror("The name of %s is too long to add the ._ prefix (the maximum is %ld characters)\n",tPOSIXPath,gMaxFileNameLength);
-					
+					tReadableForkSize=0;
+
 					break;
-				case dskFulErr:
-					
-					logerror("Unable to create the AppleDouble file of %s (the disk is full)\n",tPOSIXPath);
-					
-					break;
-					
-				case errFSQuotaExceeded:
-					
-					logerror("Unable to create the AppleDouble file of %s (your disk quota has been exceeded)\n",tPOSIXPath);
-					
-					break;
-				case dupFNErr:
-				
-					/* The file already exists, we need to try to delete it before recreating it */
-					
-					tErr=FSMakeFSRefUnicode(inParentReference,tNewFileName.length,tNewFileName.unicode,kTextEncodingDefaultFormat,&tNewFileReference);
-					
-					if (tErr==noErr)
-					{
-						/* Delete the current ._file */
-						
-						tErr=FSDeleteObject(&tNewFileReference);
-						
-						if (tErr==noErr)
-						{
-							goto tryagain;
-						}
-					}
-					
-					logerror("Unable to replace the existing AppleDouble file of %s (%d)\n",tPOSIXPath,tErr);
-					
-					break;
-				
-				case afpVolLocked:
-					
-					logerror("Unable to create the AppleDouble file of %s (the volume is locked)\n",tPOSIXPath);
-					
-					break;
-				
-				case afpAccessDenied:
-					
-					logerror("Unable to create the AppleDouble file of %s (permission denied)\n",tPOSIXPath);
-					
-					break;
-					
 				default:
-					
-					logerror("Unable to create the AppleDouble file of %s (%d)\n",tPOSIXPath,tErr);
-					
-					break;
-			}
-			
-			return -1;
-		}
-		
-		tErr=FSOpenFork(&tNewFileReference,0,NULL,fsWrPerm,&tNewFileRefNum);
-		
-		if (tErr==noErr)
-		{
-			unsigned char tAppleDoubleMagicNumber[4]=  {0x00,0x05,0x16,0x07};
-			unsigned char tAppleDoubleVersionNumber[4]={0x00,0x02,0x00,0x00};
-			unsigned char tAppleDoubleFiller[16]={0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
-			ByteCount tRequestCount;
-			UInt16 tNumberOfEntries;
-			UInt16 tSwappedNumberOfEntries;
 
-			UInt32 tEntryID;
-			UInt32 tEntryOffset;
-			UInt32 tEntryLength;
-			
-			/* Write the Magic Number */
-			
-			tRequestCount=4;
-			
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,tAppleDoubleMagicNumber,NULL);
-			
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-			
-			/* Write the Version Number */
-			
-			tRequestCount=4;
-			
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,tAppleDoubleVersionNumber,NULL);
-			
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-			
-			/* Write the Filler */
-			
-			tRequestCount=16;
-			
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,tAppleDoubleFiller,NULL);
-			
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-			
-			/* Compute the Number of Entries */
-			
-			tNumberOfEntries=0x0002;
-			
-			tSwappedNumberOfEntries=tNumberOfEntries;
-			
-#ifdef __LITTLE_ENDIAN__
-			
-			/* Swap for Intel processor */
-			
-			tSwappedNumberOfEntries=CFSwapInt16(tSwappedNumberOfEntries);
-
-#endif			
-			tRequestCount=2;
-			
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,&tSwappedNumberOfEntries,NULL);
-			
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-			
-			/* Write the Entries Descriptor */
-			
-			/* **** Finder Info */
-			
-			tEntryID=0x00000009;		/* Finder Info ID */
-			
-			tEntryOffset=0x0000001A+tNumberOfEntries*12;
-			
-			tEntryLength=0x00000020;	/* 32 bytes */
-			
-#ifdef __LITTLE_ENDIAN__
-			
-			/* Swap for Intel processor */
-			
-			tEntryID=CFSwapInt32(tEntryID);
-			
-			tEntryOffset=CFSwapInt32(tEntryOffset);
-			
-			tEntryLength=CFSwapInt32(tEntryLength);
-			
-#endif			
-			tRequestCount=4;
-			
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,&tEntryID,NULL);
-			
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-			
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,&tEntryOffset,NULL);
-			
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-			
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,&tEntryLength,NULL);
-			
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-			
-			tEntryID=0x00000002;		/* Resource Fork ID */
-				
-			tEntryOffset=0x00000052;
-				
-			if (tHasResourceFork==TRUE)
-			{
-				/* **** Finder Info */
-			
-				tEntryLength=tResourceForkSize;	/* As you can see the AppleDouble format file is not ready for forks bigger than 4 GB */
-			}
-			else
-			{
-				tEntryLength=0;
-			}
-			
-#ifdef __LITTLE_ENDIAN__
-				
-			/* Swap for Intel processor */
-		
-			tEntryID=CFSwapInt32(tEntryID);
-			
-			tEntryOffset=CFSwapInt32(tEntryOffset);
-			
-			tEntryLength=CFSwapInt32(tEntryLength);
-#endif
-
-			tRequestCount=4;
-			
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,&tEntryID,NULL);
-			
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-			
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,&tEntryOffset,NULL);
-			
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-		
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,&tEntryLength,NULL);
-		
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-			
-			/* Write the Entries */
-			
-			/* **** Write Finder Info */
-			
-#ifdef __LITTLE_ENDIAN__
-
-			/* Intel Processors */
-			
-			/* Even though it's referenced as a bytes field in the File API, this is actually a structure we need to swap... */
-
-			if (inFileCatalogInfo->nodeFlags & kFSNodeIsDirectoryMask)
-			{
-				/* It's a fragging folder */
-			
-				FolderInfo * tFolderInfoStruct;
-				ExtendedFolderInfo * tExtendedFolderInfoStruct;
-				
-				/* Swap FolderInfo Structure */
-				
-				tFolderInfoStruct=(FolderInfo *) inFileCatalogInfo->finderInfo;
-				
-				SWAP_RECT(tFolderInfoStruct->windowBounds);
-				tFolderInfoStruct->finderFlags=CFSwapInt16(tFolderInfoStruct->finderFlags);
-				SWAP_POINT(tFolderInfoStruct->location);
-				tFolderInfoStruct->reservedField=CFSwapInt16(tFolderInfoStruct->reservedField);
-				
-				/* Swap ExtendedFolderInfo Info Structure */
-				
-				tExtendedFolderInfoStruct=(ExtendedFolderInfo *) inFileCatalogInfo->extFinderInfo;
-				
-				SWAP_POINT(tExtendedFolderInfoStruct->scrollPosition);
-				tExtendedFolderInfoStruct->reserved1=CFSwapInt32(tExtendedFolderInfoStruct->reserved1);
-				tExtendedFolderInfoStruct->extendedFinderFlags=CFSwapInt16(tExtendedFolderInfoStruct->extendedFinderFlags);
-				tExtendedFolderInfoStruct->reserved2=CFSwapInt16(tExtendedFolderInfoStruct->reserved2);
-				tExtendedFolderInfoStruct->putAwayFolderID=CFSwapInt32(tExtendedFolderInfoStruct->putAwayFolderID);
-			}
-			else
-			{
-				/* I'm just a file, you know */
-				
-				FileInfo * tFileInfoStruct;
-				ExtendedFileInfo * tExtendedFileInfoStruct;
-				
-				/* Swap FileInfo Structure */
-				
-				tFileInfoStruct=(FileInfo *) inFileCatalogInfo->finderInfo;
-				
-				tFileInfoStruct->fileType=CFSwapInt32(tFileInfoStruct->fileType);
-				tFileInfoStruct->fileCreator=CFSwapInt32(tFileInfoStruct->fileCreator);
-				tFileInfoStruct->finderFlags=CFSwapInt16(tFileInfoStruct->finderFlags);
-				SWAP_POINT(tFileInfoStruct->location);
-				tFileInfoStruct->reservedField=CFSwapInt16(tFileInfoStruct->reservedField);
-				
-				/* Swap ExtendedFileInfo Structure */
-				
-				tExtendedFileInfoStruct=(ExtendedFileInfo *) inFileCatalogInfo->extFinderInfo;
-				
-				tExtendedFileInfoStruct->reserved1[0]=CFSwapInt16(tExtendedFileInfoStruct->reserved1[0]);
-				tExtendedFileInfoStruct->reserved1[1]=CFSwapInt16(tExtendedFileInfoStruct->reserved1[1]);
-				tExtendedFileInfoStruct->reserved1[2]=CFSwapInt16(tExtendedFileInfoStruct->reserved1[2]);
-				tExtendedFileInfoStruct->reserved1[3]=CFSwapInt16(tExtendedFileInfoStruct->reserved1[3]);
-				tExtendedFileInfoStruct->extendedFinderFlags=CFSwapInt16(tExtendedFileInfoStruct->extendedFinderFlags);
-				tExtendedFileInfoStruct->reserved2=CFSwapInt16(tExtendedFileInfoStruct->reserved2);
-				tExtendedFileInfoStruct->putAwayFolderID=CFSwapInt32(tExtendedFileInfoStruct->putAwayFolderID);
-			}
-
-#endif
-			
-			tRequestCount=16;
-				
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,inFileCatalogInfo->finderInfo,NULL);
-				
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-				
-			tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tRequestCount,inFileCatalogInfo->extFinderInfo,NULL);
-				
-			if (tErr!=noErr)
-			{
-				goto writebail;
-			}
-			
-			/* **** Write Resource Fork? */
-			
-			if (tHasResourceFork==TRUE)
-			{
-				/* We need to be clever and copy the Resource Fork by chunks to avoid using too much memory */
-				
-				static UInt8 * tBuffer=NULL;
-				static ByteCount tReadRequestCount=0;
-				ByteCount tReadActualCount;
-				OSErr tReadErr;
-
-#define GOLDIN_BUFFER_ONE_MEGABYTE_SIZE		1048576
-				
-				if (tBuffer==NULL)
-				{
-					tReadRequestCount=GOLDIN_BUFFER_ONE_MEGABYTE_SIZE;
-					
-					do
+					if (gDryRun==true)
 					{
-						tBuffer=(UInt8 *) malloc(tReadRequestCount*sizeof(UInt8));
-					
-						tReadRequestCount/=2;
-					}
-					while (tBuffer==NULL && tReadRequestCount>1);
-					
-					if (tBuffer!=NULL && tReadRequestCount>1)
-					{
-						tReadRequestCount*=2;
-					}
-					else
-					{
-						/* A COMPLETER */
-					}
-				}
-				
-				do
-				{
-					tReadErr=FSReadFork(tForkRefNum, fsAtMark,0, tReadRequestCount, tBuffer, &tReadActualCount);
-					
-					if (tReadErr==noErr || tReadErr==eofErr)
-					{
-						tErr=FSWriteFork(tNewFileRefNum,fsAtMark,0,tReadActualCount,tBuffer,NULL);
-						
-						if (tErr!=noErr)
-						{
-							break;
-						}
-					}
-					else
-					{
+						/* goldin would stop here, but check the rest of the split */
+
+						DryRunWarn(inPath,"its resource fork can't be read (%s); goldin stops here",strerror(errno));
+
+						tReadableForkSize=(ssize_t) tForkSize;
+
 						break;
 					}
-				
-				}
-				while (tReadErr!=eofErr);
-				
-				if (tReadErr!=eofErr)
-				{
-					/* A problem occurred while reading the Resource Fork */
-					
-					goto writebail;
-				}
-				else
-				if (tErr!=noErr)
-				{
-					/* A problem occurred while writing the Resource Fork Data to the AppleDouble file */
-					
-					goto writebail;
-				}
+
+					logerror("Unable to read the resource fork of %s (%s)\n",inPath,strerror(errno));
+
+					return -1;
 			}
+		}
+		else if (gDryRun==true && tReadableForkSize>0)
+		{
+			/* A trial read */
+
+			uint8_t tByte;
+
+			if (getxattr(inPath,XATTR_RESOURCEFORK_NAME,&tByte,1,0,XATTR_NOFOLLOW)<0)
+				DryRunWarn(inPath,"its resource fork can't be read (%s); goldin stops here",strerror(errno));
+		}
+
+		if ((uint64_t) tReadableForkSize>0xFFFFFFFF)
+		{
+			/* AppleDouble File format does not support forks bigger than 4GB */
+
+			if (gDryRun==true)
+			{
+				DryRunProcessItem(inPath);
+				DryRunWarn(inPath,"its resource fork is too big for the AppleDouble file format (more than 4 GB); goldin stops here");
+
+				return 0;
+			}
+
+			logerror("The resource fork of %s is too big for the AppleDouble file format (more than 4 GB)\n",inPath);
+			
+			return -1;
+		}
 		
-			tErr=FSCloseFork(tNewFileRefNum);
-			
-			if (tErr==noErr)
+		tResourceForkSize=(uint32_t) tReadableForkSize;
+
+		if (tResourceForkSize>0)
+			tSplitNeeded=true;
+	}
+
+	/* 2. Check for the presence of FinderInfo or ExtFinderInfo */
+
+	if (tSplitNeeded==false)
+	{
+		/* We need to save the Folder(Ext) Info in the ._ file if there are any folder/finder or extend folder/finder info */
+
+		for(i=0;i<GOLDIN_FINDER_INFO_SIZE;i++)
+		{
+			if (tFinderInfo[i]!=0)
 			{
-                if (outDidSplit!=NULL)
-                    *outDidSplit=TRUE;
-                
-                // A COMPLETER
-            }
-            
-            /* Copy the permissions (the owner and group are only copied when run as root) */
-			
-			tErr=FSSetCatalogInfo(&tNewFileReference,kFSCatInfoPermissions,inFileCatalogInfo);
-			
-			if (tErr!=noErr)
+				/* We need to create a ._file */
+
+				tSplitNeeded=true;
+				break;
+			}
+		}
+	}
+
+	if (tSplitNeeded==false)
+		return 0;
+
+	/* 3. Split */
+
+	if (gDryRun==true)
+	{
+		DryRunProcessItem(inPath);
+	}
+	else if (gVerboseMode==true)
+	{
+		printf("    splitting %s...\n",inPath);
+	}
+
+	/* The ._ file goes in the parent folder, which isn't on the same volume as the root of a volume */
+
+	if (statfs(inPath,&tStatFileSystem)==0 && strcmp(tStatFileSystem.f_mntonname,inPath)==0)
+	{
+		if (gDryRun==true)
+		{
+			DryRunWarn(inPath,"it is the root of a volume, so its AppleDouble file can't be created; goldin stops here");
+
+			return 0;
+		}
+
+		logerror("Unable to create the AppleDouble file of %s (it is the root of a volume)\n",inPath);
+
+		return -1;
+	}
+
+	tFileName=strrchr(inPath,'/')+1;
+
+	if (snprintf(tAppleDoublePath,sizeof(tAppleDoublePath),"%.*s._%s",(int) (tFileName-inPath),inPath,tFileName)>=(int) sizeof(tAppleDoublePath))
+	{
+		if (gDryRun==true)
+		{
+			DryRunWarn(inPath,"the path of its AppleDouble file is too long; goldin stops here");
+
+			return 0;
+		}
+
+		logerror("Unable to create the AppleDouble file of %s (the path is too long)\n",inPath);
+
+		return -1;
+	}
+
+	/* A dry run checks what it can, but writes nothing */
+
+	if (gDryRun==true)
+	{
+		DryRunCheckAppleDoubleFile(inPath,inFileStat,tFileName,tAppleDoublePath,tResourceForkSize);
+
+		return 0;
+	}
+
+	/* We need to create a ._file */
+
+tryagain:
+
+	tNewFileDescriptor=open(tAppleDoublePath,O_WRONLY|O_CREAT|O_EXCL,S_IRUSR|S_IWUSR);
+
+	if (tNewFileDescriptor<0)
+	{
+		switch(errno)
+		{
+			case ENAMETOOLONG:
+				/* The file name is too long */
+
+				/* Write the error */
+
+				logerror("The name of %s is too long to add the ._ prefix (the maximum is %ld characters)\n",inPath,gMaxFileNameLength);
+
+				break;
+			case ENOSPC:
+
+				logerror("Unable to create the AppleDouble file of %s (the disk is full)\n",inPath);
+
+				break;
+
+			case EDQUOT:
+
+				logerror("Unable to create the AppleDouble file of %s (your disk quota has been exceeded)\n",inPath);
+
+				break;
+			case EEXIST:
+
+				/* The file already exists, we need to try to delete it before recreating it */
+
+				if (unlink(tAppleDoublePath)==0)
+				{
+					goto tryagain;
+				}
+
+				logerror("Unable to replace the existing AppleDouble file of %s (%s)\n",inPath,strerror(errno));
+
+				break;
+
+			case EROFS:
+
+				logerror("Unable to create the AppleDouble file of %s (the volume is locked)\n",inPath);
+
+				break;
+
+			case EACCES:
+
+				logerror("Unable to create the AppleDouble file of %s (permission denied)\n",inPath);
+
+				break;
+
+			default:
+
+				logerror("Unable to create the AppleDouble file of %s (%s)\n",inPath,strerror(errno));
+
+				break;
+		}
+		
+		return -1;
+	}
+
+	/* Write the Magic Number */
+
+	OSWriteBigInt32(tHeader,0x00,0x00051607);
+
+	/* Write the Version Number */
+
+	OSWriteBigInt32(tHeader,0x04,0x00020000);
+
+	/* Write the Filler */
+
+	memset(tHeader+0x08,0,16);
+
+	/* Write the Number of Entries */
+
+	OSWriteBigInt16(tHeader,0x18,GOLDIN_NUMBER_OF_ENTRIES);
+
+	/* Write the Entries Descriptor */
+
+	/* **** Finder Info */
+
+	OSWriteBigInt32(tHeader,0x1A,0x00000009);				/* Finder Info ID */
+	OSWriteBigInt32(tHeader,0x1E,GOLDIN_HEADER_SIZE);
+	OSWriteBigInt32(tHeader,0x22,GOLDIN_FINDER_INFO_SIZE);	/* 32 bytes */
+
+	/* **** Resource Fork */
+
+	OSWriteBigInt32(tHeader,0x26,0x00000002);				/* Resource Fork ID */
+	OSWriteBigInt32(tHeader,0x2A,GOLDIN_HEADER_SIZE+GOLDIN_FINDER_INFO_SIZE);
+	OSWriteBigInt32(tHeader,0x2E,tResourceForkSize);		/* As you can see the AppleDouble format file is not ready for forks bigger than 4 GB */
+
+	/* Write the Entries */
+
+	/* **** Write Finder Info (it is already in the big-endian layout of the AppleDouble file, so there is nothing to swap) */
+
+	memcpy(tHeader+GOLDIN_HEADER_SIZE,tFinderInfo,GOLDIN_FINDER_INFO_SIZE);
+
+	if (WriteBuffer(tNewFileDescriptor,tHeader,sizeof(tHeader))!=0)
+	{
+		tErrno=errno;
+
+		goto writebail;
+	}
+
+	/* **** Write Resource Fork? */
+
+	if (tResourceForkSize>0)
+	{
+		/* We need to be clever and copy the Resource Fork by chunks to avoid using too much memory */
+
+		static uint8_t sBuffer[GOLDIN_BUFFER_ONE_MEGABYTE_SIZE];
+		uint32_t tCopiedSize=0;
+
+		while (tCopiedSize<tResourceForkSize)
+		{
+			size_t tReadRequestCount=sizeof(sBuffer);
+			ssize_t tReadActualCount;
+
+			if (tReadRequestCount>tResourceForkSize-tCopiedSize)
+				tReadRequestCount=tResourceForkSize-tCopiedSize;
+
+			tReadActualCount=getxattr(inPath,XATTR_RESOURCEFORK_NAME,sBuffer,tReadRequestCount,tCopiedSize,XATTR_NOFOLLOW);
+
+			if (tReadActualCount<=0)
 			{
-				logerror("Permissions, owner and group could not be set for the AppleDouble file of %s\n",tPOSIXPath);
-				
-				tErr=-1;
-				
-				goto byebye;
+				/* A problem occurred while reading the Resource Fork */
+
+				if (tReadActualCount<0)
+					logerror("Unable to read the resource fork of %s (%s)\n",inPath,strerror(errno));
+				else
+					logerror("Unable to read the resource fork of %s (it was shortened while being copied)\n",inPath);
+
+				goto deletebail;
+			}
+
+			if (WriteBuffer(tNewFileDescriptor,sBuffer,(size_t) tReadActualCount)!=0)
+			{
+				/* A problem occurred while writing the Resource Fork Data to the AppleDouble file */
+
+				tErrno=errno;
+
+				goto writebail;
+			}
+
+			tCopiedSize+=(uint32_t) tReadActualCount;
+		}
+	}
+
+	/* Copy the permissions (the owner and group are only copied when run as root) */
+
+	if ((geteuid()==0 && fchown(tNewFileDescriptor,inFileStat->st_uid,inFileStat->st_gid)!=0 && errno!=EPERM) ||
+		fchmod(tNewFileDescriptor,inFileStat->st_mode & ALLPERMS)!=0)
+	{
+		logerror("Permissions, owner and group could not be set for the AppleDouble file of %s (%s)\n",inPath,strerror(errno));
+
+		close(tNewFileDescriptor);
+
+		return -1;
+	}
+
+	if (close(tNewFileDescriptor)!=0)
+	{
+		tErrno=errno;
+
+		tNewFileDescriptor=-1;
+
+		goto writebail;
+	}
+
+	/* Strip the resource fork, now that it has been copied. A hard link (split with --linksplit) keeps its resource fork:
+	   stripping it would remove it from the file under all its names, and those elsewhere may have no AppleDouble file */
+
+	if (tResourceForkSize>0 && gStripResourceForks==true && tIsHardLink==false)
+	{
+		if (removexattr(inPath,XATTR_RESOURCEFORK_NAME,XATTR_NOFOLLOW)!=0)
+		{
+			switch(errno)
+			{
+				case ENOATTR:
+					/* This is not important */
+					break;
+				default:
+					logerror("Resource fork could not be stripped from %s (%s)\n",inPath,strerror(errno));
+
+					return -1;
 			}
 		}
 		else
 		{
-			/* Report the error and stop: carrying on would strip (with --strip) a resource fork that was never copied */
-			
-			logerror("Unable to open the AppleDouble file of %s for writing (%d)\n",tPOSIXPath,tErr);
-			
-			FSDeleteObject(&tNewFileReference);
-			
-			tErr=-1;
-			
-			goto byebye;
-		}
-		
-		/* Close the Resource Fork if needed */
-		
-		if (tHasResourceFork==TRUE)
-		{
-			tErr=FSCloseFork(tForkRefNum);
-		
-			if (gStripResourceForks==TRUE && tErr==noErr)
-			{
-				/* Strip the resource fork */
-				
-				tErr=FSDeleteFork(inFileReference,sResourceForkName.length,sResourceForkName.unicode);
-				
-				if (tErr!=noErr)
-				{
-					switch(tErr)
-					{
-						case errFSForkNotFound:
-							/* This is not important */
-							tErr=noErr;
-							break;
-						default:
-							logerror("Resource fork could not be stripped from %s (%d)\n",tPOSIXPath,tErr);
-							break;
-					}
-				}
-			}
-			else
-			{
-				if (gStripResourceForks==TRUE && tErr!=noErr)
-				{
-					logerror("Resource fork could not be stripped from %s\n",tPOSIXPath);
-				
-					/* A COMPLETER */
-				}
-			}
+			tStripped=true;
 		}
 	}
-	
-	return tErr;
-	
+
+	/* With --warnsymlink, report items reached through a symbolic link */
+
+	if (gWarnSymbolicLinks==true && gSymbolicLink[0]!='\0')
+		logerror("Warning: %s %s, reached through the symbolic link \"%s\"\n",(tStripped==true) ? "split and stripped" : "split",inPath,gSymbolicLink);
+
+	return 0;
+
 writebail:
 
-	switch(tErr)
+	switch(tErrno)
 	{
-		case dskFulErr:
-			logerror("Unable to write the AppleDouble file of %s (the disk is full)\n",tPOSIXPath);
+		case ENOSPC:
+			logerror("Unable to write the AppleDouble file of %s (the disk is full)\n",inPath);
 			break;
-		case errFSQuotaExceeded:
-			logerror("Unable to write the AppleDouble file of %s (your disk quota has been exceeded)\n",tPOSIXPath);
+		case EDQUOT:
+			logerror("Unable to write the AppleDouble file of %s (your disk quota has been exceeded)\n",inPath);
 			break;
 		default:
-			logerror("An unknown error occurred while writing the AppleDouble file of %s (%d)\n",tPOSIXPath,tErr);
+			logerror("Unable to write the AppleDouble file of %s (%s)\n",inPath,strerror(tErrno));
 			break;
 	}
-	
-	FSCloseFork(tNewFileRefNum);
-	
+
+deletebail:
+
+	if (tNewFileDescriptor>=0)
+		close(tNewFileDescriptor);
+
 	/* Don't leave a partial AppleDouble file behind */
-	
-	FSDeleteObject(&tNewFileReference);
-	
-byebye:
 
-	if (tHasResourceFork==TRUE)
-	{
-		FSCloseFork(tForkRefNum);
-	}
-	
-	return tErr;
+	unlink(tAppleDoublePath);
+
+	return -1;
 }
 
-static void LogCatalogInfoError(FSRef * inReferencePtr,OSErr inErr)
+static void LogFolderReadError(const char * inPath,int inErrno)
 {
-	UInt8 tPath[PATH_MAX];
-	
-	if (FSRefMakePath(inReferencePtr,tPath,sizeof(tPath))==noErr)
-		logerror("An error occurred while getting the catalog information of %s (%d)\n",(char *) tPath,inErr);
+	if (inErrno==EACCES)
+		logerror("Unable to read the contents of %s (permission denied)\n",inPath);
 	else
-		logerror("An error occurred while getting the catalog information of a file or directory (%d)\n",inErr);
+		logerror("Unable to read the contents of %s (%s)\n",inPath,strerror(inErrno));
 }
 
-static void LogFolderReadError(FSRef * inReferencePtr,OSErr inErr)
-{
-	UInt8 tPath[PATH_MAX];
-	const char * tName="a directory";
-	
-	if (FSRefMakePath(inReferencePtr,tPath,sizeof(tPath))==noErr)
-		tName=(const char *) tPath;
-	
-	if (inErr==afpAccessDenied)
-		logerror("Unable to read the contents of %s (permission denied)\n",tName);
-	else
-		logerror("Unable to read the contents of %s (%d)\n",tName,inErr);
-}
+/* Split the forks of an item and, for a folder, of its contents */
 
-void SplitForks(FSRef * inItemReferencePtr)
+static int SplitForks(const char * inPath)
 {
-	FSCatalogInfo tInfo;
-    HFSUniStr255 tUnicodeFileName;
-    FSRef tParentReference;
-    
-    /* We need to split forks of the first level (and it allows us to check whether it's a folder or not) */
-    
-    OSErr tErr=FSGetCatalogInfo(inItemReferencePtr,kFSCatInfoFinderInfo+kFSCatInfoFinderXInfo+kFSCatInfoPermissions+kFSCatInfoNodeFlags,&tInfo,&tUnicodeFileName,NULL,&tParentReference);
-    
-    if (tErr==noErr)
-    {
-        /* Check this is not a Hard Link */
-        
-        if ((tInfo.nodeFlags & kFSNodeHardLinkMask)==0)
-        {
-            tErr=SplitFileIfNeeded(inItemReferencePtr,&tParentReference,&tInfo,&tUnicodeFileName,NULL);
-            
-            if (tErr==noErr)
-            {
-                if (tInfo.nodeFlags & kFSNodeIsDirectoryMask)
-                {
-                    /* It's a folder */
-                    
-                    /* We need to proceed with the contents of the folder */
-                    
-                    SplitForksChildren(inItemReferencePtr,&tParentReference);
-                }
-            }
-            else
-            {
-                exit(-1);
-            }
-        }
-    }
-    else
-    {
-        LogCatalogInfoError(inItemReferencePtr,tErr);
-        
-        exit(-1);
-    }
-}
+	char * tPaths[]={(char *) inPath,NULL};
+	FTS * tFileSystem;
+	FTSENT * tEntry;
+	dev_t tDevice=0;
+	int tStatus=0;
 
-void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr)
-{
-	FSIterator tIterator;
-    
-	OSErr tErr=FSOpenIterator(inFileReferencePtr,kFSIterateFlat,&tIterator);
-	
-	if (tErr==noErr)
+	/* fts reads the list of a folder's items before returning any of them, so the ._ files written in the folder are not
+	   met (and split) again */
+
+	tFileSystem=fts_open(tPaths,FTS_PHYSICAL|FTS_NOCHDIR|FTS_XDEV,NULL);
+
+	if (tFileSystem==NULL)
 	{
-		Boolean tIteratorIsOpen=TRUE;
-		
-		FSRef * tFoundReferences=(FSRef *) malloc(sizeof(FSRef));
-		
-		do
+		if (gDryRun==true)
 		{
-			ItemCount tFoundItems;
-            
-            tErr=FSGetCatalogInfoBulk(tIterator, 1, &tFoundItems,NULL, 0, NULL,tFoundReferences, NULL, NULL);
-			
-			if (tErr==noErr)
-			{
-                FSCatalogInfo tInfo;
-                HFSUniStr255 tUnicodeFileName;
-                
-                /* Retrieve the CatalogInfo with FSGetCatalogInfo because FSGetCatalogInfoBulk is buggy on Yosemite */
-                
-                tErr=FSGetCatalogInfo(&tFoundReferences[0],kFSCatInfoFinderInfo+kFSCatInfoFinderXInfo+kFSCatInfoPermissions+kFSCatInfoNodeFlags,&tInfo,&tUnicodeFileName,NULL,NULL);
-                
-                if (tErr==noErr)
-                {
-                    /* Check this is not a Hard Link */
-                    
-                    if ((tInfo.nodeFlags & kFSNodeHardLinkMask)==0)
-                    {
-                        Boolean tDidSplit=FALSE;
-                        
-                        tErr=SplitFileIfNeeded(&tFoundReferences[0],inFileReferencePtr,&tInfo,&tUnicodeFileName,&tDidSplit);
-                            
-                        if (tErr==noErr)
-                        {
-                            /* With --norecurse, folders inside the path are split but not descended into */
+			DryRunWarn(inPath,"can't get information about it (%s); goldin stops here",strerror(errno));
 
-                            if ((tInfo.nodeFlags & kFSNodeIsDirectoryMask) && gNoRecurse==FALSE)
-                            {
-                                /* 2. We need to proceed with the contents of the folder */
-                            
-                                SplitForksChildren(&tFoundReferences[0],inFileReferencePtr);
-                            }
-                            
-                            /* 3. Check whether the filesystem item was split (i.e. the valence of the folder changed) */
-                            
-                            if (tDidSplit==TRUE)
-                            {
-                                FSCloseIterator(tIterator);
-                                
-                                tIteratorIsOpen=FALSE;
-                                
-                                tErr=FSOpenIterator(inFileReferencePtr,kFSIterateFlat,&tIterator);
-                                
-                                if (tErr==noErr)
-                                {
-                                    tIteratorIsOpen=TRUE;
-                                    
-                                    FSRef tPreviousCacheRef=tFoundReferences[0];
-                                    
-                                    do
-                                    {
-                                        tErr=FSGetCatalogInfoBulk(tIterator, 1, &tFoundItems,NULL, 0, NULL,tFoundReferences, NULL, NULL);
-                                        
-                                        if (tErr==noErr)
-                                        {
-                                            OSErr tCompareErr=FSCompareFSRefs(&tPreviousCacheRef,&tFoundReferences[0]);
-                                            
-                                            if (tCompareErr==noErr)
-                                            {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    while (tErr==noErr);
-                                }
-                            }
-                        }
-                        else
-                        {
-                            exit(-1);
-                        }
-                    }
-                }
-                else
-                {
-                    LogCatalogInfoError(&tFoundReferences[0],tErr);
-                    
-                    exit(-1);
-                }
-			}
+			return 0;
 		}
-		while (tErr==noErr);
-		
-		free(tFoundReferences);
-		
-		if (tIteratorIsOpen==TRUE)
-			FSCloseIterator(tIterator);
+
+		logerror("Unable to get information about %s (%s)\n",inPath,strerror(errno));
+
+		return -1;
 	}
-	
-	if (tErr!=noErr)
+
+	while (tStatus==0 && (tEntry=fts_read(tFileSystem))!=NULL)
 	{
-		switch(tErr)
+		switch(tEntry->fts_info)
 		{
-			case errFSNoMoreItems:
-				/* No more items in the folder, this is perfectly ok */
+			case FTS_D:
+
+				if (tEntry->fts_level==FTS_ROOTLEVEL)
+				{
+					tDevice=tEntry->fts_statp->st_dev;
+				}
+				else
+				{
+					/* A volume mounted inside the folder is left alone (and FTS_XDEV doesn't descend into it) */
+
+					if (tEntry->fts_statp->st_dev!=tDevice)
+					{
+						if (gDryRun==true)
+							DryRunAddItem(tEntry->fts_path,false,"a volume is mounted here");
+
+						break;
+					}
+
+					/* With --norecurse, folders inside the path are split but not descended into */
+
+					if (gNoRecurse==true)
+						fts_set(tFileSystem,tEntry,FTS_SKIP);
+				}
+
+				tStatus=SplitFileIfNeeded(tEntry->fts_path,tEntry->fts_statp);
+
 				break;
-			default:
+
+			case FTS_F:
+			case FTS_DEFAULT:
+
+				/* Check this is not a Hard Link (unless --linksplit) */
+
+				if (gSplitHardLinks==false && S_ISREG(tEntry->fts_statp->st_mode) && tEntry->fts_statp->st_nlink>1)
+				{
+					if (gDryRun==true)
+						DryRunAddItem(tEntry->fts_path,false,"hard link");
+
+					break;
+				}
+
+				tStatus=SplitFileIfNeeded(tEntry->fts_path,tEntry->fts_statp);
+
+				break;
+
+			case FTS_SL:
+			case FTS_SLNONE:
+
+				/* Symbolic links are not split */
+
+				if (gDryRun==true)
+					DryRunAddItem(tEntry->fts_path,false,"symbolic link");
+
+				break;
+
+			case FTS_DNR:
+			case FTS_ERR:
+
 				/* Report the folder and carry on with the rest of the tree */
+
+				if (gDryRun==true)
+				{
+					if (tEntry->fts_errno==EACCES)
+						DryRunWarn(tEntry->fts_path,"its contents can't be read (permission denied), so they are skipped");
+					else
+						DryRunWarn(tEntry->fts_path,"its contents can't be read (%s), so they are skipped",strerror(tEntry->fts_errno));
+
+					break;
+				}
+
+				LogFolderReadError(tEntry->fts_path,tEntry->fts_errno);
+
+				break;
+
+			case FTS_NS:
+
+				if (gDryRun==true)
+				{
+					DryRunWarn(tEntry->fts_path,"can't get information about it (%s); goldin stops here",strerror(tEntry->fts_errno));
+
+					break;
+				}
+
+				logerror("Unable to get information about %s (%s)\n",tEntry->fts_path,strerror(tEntry->fts_errno));
+
+				tStatus=-1;
+
+				break;
+
+			case FTS_DC:
+
+				/* A folder that contains itself */
+
+				if (gDryRun==true)
+					DryRunAddItem(tEntry->fts_path,false,"folder that contains itself");
+
+				break;
+
+			default:
 				
-				LogFolderReadError(inFileReferencePtr,tErr);
+				/* FTS_DP: a folder whose contents have been processed */
+				
 				break;
 		}
 	}
+	
+	if (tStatus==0 && errno!=0)
+	{
+		/* fts_read returns NULL, with errno set to 0 when the whole tree has been read */
+
+		if (gDryRun==true)
+			DryRunWarn(inPath,"its contents can't all be read (%s); goldin stops here",strerror(errno));
+		else
+			logerror("Unable to read the contents of %s (%s)\n",inPath,strerror(errno));
+
+		if (gDryRun==false)
+			tStatus=-1;
+	}
+	
+	fts_close(tFileSystem);
+
+	return tStatus;
 }
 
 static void usage(const char * inProcessName)
@@ -1049,14 +1167,36 @@ static void usage(const char * inProcessName)
            "  --verbose, -v        Verbose mode\n"\
            "  --strip, -s          Strip resource fork from source after splitting\n"\
            "  --apfs, -a           Allow APFS volumes as well as HFS and HFS+\n"\
+           "  --linksplit, -l      Split hard links too (never stripped)\n"\
+           "  --warnsymlink, -w    Report items split through a symbolic link\n"\
+           "  --dryrun, -d         List what would be split, and any problems\n"\
            "  --norecurse          Do not descend into subdirectories\n"\
            "  --version            Show the version of this tool\n"\
            "\n");
 }
 
+/* --dryrun: the absolute path of a PATH that can't be resolved, to list it */
+
+static void DryRunAbsolutePath(const char * inPath,char * outPath,size_t inMaxLength)
+{
+	char tCurrentFolder[PATH_MAX];
+
+	if (inPath[0]=='/' || getcwd(tCurrentFolder,sizeof(tCurrentFolder))==NULL)
+		snprintf(outPath,inMaxLength,"%s",inPath);
+	else
+		snprintf(outPath,inMaxLength,"%s/%s",tCurrentFolder,inPath);
+}
+
 static int SplitPath(const char * inPath)
 {
 	char tResolvedPath[PATH_MAX];
+
+	/* With --warnsymlink, find out whether the PATH, as it was given, goes through a symbolic link */
+
+	gSymbolicLink[0]='\0';
+
+	if (gWarnSymbolicLinks==true)
+		FindSymbolicLink(inPath,gSymbolicLink,sizeof(gSymbolicLink));
 
 	if (realpath(inPath,tResolvedPath)!=NULL)
 	{
@@ -1064,6 +1204,16 @@ static int SplitPath(const char * inPath)
 
 		if (statfs(tResolvedPath,&tStatFileSystem)!=0)
 		{
+			if (gDryRun==true)
+			{
+				if (errno==ENOENT)
+					DryRunWarn(tResolvedPath,"it was not found; goldin stops here");
+				else
+					DryRunWarn(tResolvedPath,"its file system information can't be read (%s); goldin stops here",strerror(errno));
+
+				return 0;
+			}
+
 			switch(errno)
 			{
 				case ENOENT:
@@ -1084,16 +1234,28 @@ static int SplitPath(const char * inPath)
 		   goldin writes would collide with, so those are always refused. APFS is only
 		   accepted with --apfs, so that goldin otherwise behaves as SplitForks does. */
 
-		Boolean tIsHFS=(strcmp(tStatFileSystem.f_fstypename,"hfs")==0);
-		Boolean tIsAPFS=(strcmp(tStatFileSystem.f_fstypename,"apfs")==0);
+		bool tIsHFS=(strcmp(tStatFileSystem.f_fstypename,"hfs")==0);
+		bool tIsAPFS=(strcmp(tStatFileSystem.f_fstypename,"apfs")==0);
 
-		if (tIsHFS==FALSE && (tIsAPFS==FALSE || gAllowAPFS==FALSE))
+		if (tIsHFS==false && (tIsAPFS==false || gAllowAPFS==false))
 		{
 			/* Return (-2) if this is not a supported file system */
 
-			if (tIsAPFS==TRUE)
+			if (gDryRun==true)
+			{
+				if (tIsAPFS==true)
+					DryRunWarn(tResolvedPath,"it is on an APFS volume (use -a or --apfs to allow APFS); goldin stops here");
+				else if (gAllowAPFS==true)
+					DryRunWarn(tResolvedPath,"it is not on an HFS, HFS+ or APFS volume; goldin stops here");
+				else
+					DryRunWarn(tResolvedPath,"it is not on an hfs disk; goldin stops here");
+
+				return 0;
+			}
+
+			if (tIsAPFS==true)
 				logerror("\"%s\" is on an APFS volume; use -a or --apfs to allow APFS\n",inPath);
-			else if (gAllowAPFS==TRUE)
+			else if (gAllowAPFS==true)
 				logerror("\"%s\" is not on an HFS, HFS+ or APFS volume\n",inPath);
 			else
 				logerror("\"%s\" is not on an hfs disk\n",inPath);
@@ -1105,6 +1267,13 @@ static int SplitPath(const char * inPath)
 
 		if (gMaxFileNameLength<0)
 		{
+			if (gDryRun==true)
+			{
+				DryRunWarn(tResolvedPath,"the maximum file name length can't be found (%s); goldin stops here",strerror(errno));
+
+				return 0;
+			}
+
 			logerror("An error occurred while getting the maximum file name length for \"%s\" (%s)\n",inPath,strerror(errno));
 
 			return -1;
@@ -1112,23 +1281,29 @@ static int SplitPath(const char * inPath)
 
 		gMaxFileNameLength-=2;
 
-		FSRef tFileReference;
-		OSStatus tErr=FSPathMakeRef((const UInt8 *) tResolvedPath,&tFileReference,NULL);
-
-		if (tErr!=noErr)
-		{
-			logerror("An error occurred while getting the File System Reference of %s\n",inPath);
-
-			return -1;
-		}
-
-		if (gVerboseMode==TRUE)
+		if (gVerboseMode==true && gDryRun==false)
 			printf("Splitting %s...\n",inPath);
 
-		SplitForks(&tFileReference);
+		if (SplitForks(tResolvedPath)!=0)
+			return -1;
 	}
 	else
 	{
+		if (gDryRun==true)
+		{
+			char tAbsolutePath[PATH_MAX];
+			int tErrno=errno;
+
+			DryRunAbsolutePath(inPath,tAbsolutePath,sizeof(tAbsolutePath));
+
+			if (tErrno==ENOENT)
+				DryRunWarn(tAbsolutePath,"it was not found; goldin stops here");
+			else
+				DryRunWarn(tAbsolutePath,"its path can't be resolved (%s); goldin stops here",strerror(tErrno));
+
+			return 0;
+		}
+
 		switch(errno)
 		{
 			case ENOENT:
@@ -1161,6 +1336,9 @@ int main (int argc, const char * argv[])
             {"verbose",                     no_argument,        NULL,    'v'},
             {"strip",                       no_argument,        NULL,    's'},
             {"apfs",                        no_argument,        NULL,    'a'},
+            {"linksplit",                   no_argument,        NULL,    'l'},
+            {"warnsymlink",                 no_argument,        NULL,    'w'},
+            {"dryrun",                      no_argument,        NULL,    'd'},
             {"norecurse",                   no_argument,        NULL,    0},
             {"version",                     no_argument,        NULL,    0},
 
@@ -1169,7 +1347,7 @@ int main (int argc, const char * argv[])
 
         int tOptionIndex = 0;
 
-        c = getopt_long (argc, (char **) argv, "ahsuv",tLongOptions, &tOptionIndex);
+        c = getopt_long (argc, (char **) argv, "adhlsuvw",tLongOptions, &tOptionIndex);
 
         /* Detect the end of the options. */
         if (c == -1)
@@ -1187,26 +1365,44 @@ int main (int argc, const char * argv[])
                 }
                 else if (strncmp(tLongOptions[tOptionIndex].name,"norecurse",strlen("norecurse"))==0)
                 {
-                    gNoRecurse=TRUE;
+                    gNoRecurse=true;
                 }
 
                 break;
 
             case 's':
 
-                gStripResourceForks=TRUE;
+                gStripResourceForks=true;
 
                 break;
 
             case 'a':
 
-                gAllowAPFS=TRUE;
+                gAllowAPFS=true;
+
+                break;
+
+            case 'l':
+
+                gSplitHardLinks=true;
+
+                break;
+
+            case 'w':
+
+                gWarnSymbolicLinks=true;
+
+                break;
+
+            case 'd':
+
+                gDryRun=true;
 
                 break;
 
             case 'v':
 
-                gVerboseMode=TRUE;
+                gVerboseMode=true;
 
                 break;
 
@@ -1222,6 +1418,11 @@ int main (int argc, const char * argv[])
                 break;
         }
     }
+
+	/* A dry run writes nothing, so --strip is ignored */
+
+	if (gDryRun==true)
+		gStripResourceForks=false;
 
 	argv+=optind;
     argc-=optind;
@@ -1242,6 +1443,11 @@ int main (int argc, const char * argv[])
 		if (tStatus!=0)
 			return tStatus;
 	}
+
+	/* A dry run checks every PATH, then lists what it found */
+
+	if (gDryRun==true)
+		return DryRunList();
 
     return 0;
 }

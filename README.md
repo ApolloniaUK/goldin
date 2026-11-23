@@ -29,6 +29,9 @@ should also go away.
 	  --verbose, -v        Verbose mode
 	  --strip, -s          Strip resource fork from source after splitting
 	  --apfs, -a           Allow APFS volumes as well as HFS and HFS+
+	  --linksplit, -l      Split hard links too (never stripped)
+	  --warnsymlink, -w    Report items split through a symbolic link
+	  --dryrun, -d         List what would be split, and any problems
 	  --norecurse          Do not descend into subdirectories
 	  --version            Show the version of this tool
 
@@ -37,6 +40,22 @@ only the files and folders directly inside it are split.
 
 Goldin accepts one or more paths and processes them in turn. Folders that cannot
 be read are reported and skipped; any other error stops Goldin.
+
+Symbolic links inside a folder are neither split nor followed; a path that is a
+symbolic link, or goes through one, is resolved, and its target is split. With
+`-w` or `--warnsymlink`, Goldin reports each item it splits this way.
+
+Files with more than one hard link are skipped unless `-l` or `--linksplit` is
+given. Even then, `--strip` leaves their resource fork in place: stripping it
+through one name would remove it from the file under all its names, and those
+elsewhere may have no AppleDouble file.
+
+`-d` or `--dryrun` checks a run without writing anything. It lists what would
+be split, with a `WARNING:` line under each item for every problem found, such
+as a resource fork that can't be read, a folder that can't be written to, a
+name that is too long or a volume without enough free space. With `-v`, it
+lists everything, marking each item `Process:` or `Ignored:`. It exits with
+status 1 if it found any problems.
 
 Like SplitForks, Goldin only works on HFS and HFS+ volumes unless `-a` or
 `--apfs` is given, which allows APFS volumes as well. Other file systems are
