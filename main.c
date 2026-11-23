@@ -93,6 +93,8 @@ SUCH DAMAGE.
     |          |             | - Add -d/--dryrun: list what would be split, and any    |
     |          |             |   problems, without writing anything                    |
     |          |             | - Report a volume root that needs splitting clearly     |
+    |          |             | - Report a name too long for the ._ prefix as such on   |
+    |          |             |   HFS Standard volumes                                  |
     |          |             | - Fix the DEBUG build (logerror macro)                  |
     +----------+-------------+---------------------------------------------------------+
     |          |             |                                                         |
@@ -139,6 +141,10 @@ SUCH DAMAGE.
 #define GOLDIN_VERSION "0.1.0"
 
 long gMaxFileNameLength=0;
+
+/* Whether the volume of the PATH being processed is HFS Standard, whose names are up to 31 MacRoman characters */
+
+bool gNamesInMacRoman=false;
 bool gStripResourceForks=false;
 bool gVerboseMode=false;
 bool gNoRecurse=false;
@@ -353,19 +359,35 @@ static void DryRunWarn(const char * inPath,const char * inFormat,...)
 }
 
 /* The length of a name as the file system counts it. HFS+ and APFS both allow 255 UTF-16 units, counted in the form
-   the name is stored in (decomposed on HFS+), which is the form it is read back in */
+   the name is stored in (decomposed on HFS+), which is the form it is read back in. HFS Standard allows 31 MacRoman
+   characters, in which an accent combines with the letter before it: its names come back decomposed, so combining
+   marks (U+0300 to U+036F) are not counted */
 
-static size_t DryRunNameLength(const char * inName)
+static size_t NameLength(const char * inName)
 {
 	const unsigned char * tByte;
 	size_t tLength=0;
 
 	for (tByte=(const unsigned char *) inName;*tByte!='\0';tByte++)
 	{
-		/* Count the first byte of each character; those outside the BMP need 2 UTF-16 units */
+		if ((*tByte & 0xC0)==0x80)
+			continue;
 
-		if ((*tByte & 0xC0)!=0x80)
+		if (gNamesInMacRoman==true)
+		{
+			/* U+0300 to U+036F are 0xCC 0x80 to 0xCD 0xAF in UTF-8 */
+
+			if (*tByte==0xCC || (*tByte==0xCD && tByte[1]<0xB0))
+				continue;
+
+			tLength++;
+		}
+		else
+		{
+			/* Count the first byte of each character; those outside the BMP need 2 UTF-16 units */
+
 			tLength+=(*tByte>=0xF0) ? 2 : 1;
+		}
 	}
 
 	return tLength;
@@ -428,7 +450,7 @@ static void DryRunCheckAppleDoubleFile(const char * inPath,const struct stat * i
 
 	/* The name must leave room for the ._ prefix */
 
-	if ((long) DryRunNameLength(inFileName)>gMaxFileNameLength)
+	if ((long) NameLength(inFileName)>gMaxFileNameLength)
 		DryRunWarn(inPath,"its name is too long to add the ._ prefix (the maximum is %ld characters); goldin stops here",gMaxFileNameLength);
 
 	/* The AppleDouble file is created in the item's folder */
@@ -773,6 +795,19 @@ tryagain:
 	{
 		switch(errno)
 		{
+			case EINVAL:
+
+				/* HFS Standard reports a name that is too long with EINVAL */
+
+				if ((long) NameLength(tFileName)<=gMaxFileNameLength)
+				{
+					logerror("Unable to create the AppleDouble file of %s (%s)\n",inPath,strerror(errno));
+
+					break;
+				}
+
+				/* Fall through */
+
 			case ENAMETOOLONG:
 				/* The file name is too long */
 
@@ -1278,6 +1313,10 @@ static int SplitPath(const char * inPath)
 
 			return -1;
 		}
+
+		/* HFS Standard volumes report 31, HFS+ and APFS 255 */
+
+		gNamesInMacRoman=(gMaxFileNameLength<255);
 
 		gMaxFileNameLength-=2;
 
