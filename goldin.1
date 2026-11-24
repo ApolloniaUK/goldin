@@ -1,0 +1,53 @@
+.\" Copyright (c) 2026, Stephane Sudre.
+.Dd September 17, 2026
+.Dt GOLDIN 1
+.Os "macOS"
+.Sh NAME
+.Nm /usr/local/bin/goldin
+.Nd Divide an HFS/HFS+ file with 2 forks into a data fork and AppleDouble encoded resource fork.
+.Sh SYNOPSIS
+.Nm
+.Op Fl \-version
+.Op Fl h , Fl \-help
+.Op Fl s , \-strip
+.Op Fl v , \-verbose
+.Ar FILE|DIRECTORY [FILE|DIRECTORY]...
+.Sh DESCRIPTION
+Goldin does the same job as 
+.Xr SplitForks 1
+with some enhanced functionality. It converts Macintosh HFS or HFS Extended 
+("HFS+") two-fork files into AppleDouble format with the data fork and the 
+resource fork plus file system metadata in separate files. The original 
+SplitForks only acted on one file, goldin can act on more than one file and 
+can also be invoked with one or more directories ans will search each 
+directory recursively for files to convert,
+.Pp
+.Nm
+accepts these options and arguments:
+.Bl -tag -width -indent
+.It Fl \-version
+Show tool version and exit.
+.It Fl h , Fl \-help
+Show usage summary and exit.
+.It Fl s , Fl \-strip
+Strip the resource fork from the original file.  The default is to leave the resource file in place after copying it to its AppleDouble metadata file.
+.It Fl v , Fl \-verbose
+.It Ar FILE|DIRECTORY ...
+The file to split.  
+.El
+.Pp
+.Sh FILE|DIRECTORY
+.Bl -tag -width -indent
+.It example     - a file to convert
+.It example.d/  - a directoru to search for files0 to convert
+.El
+.Sh NOTES
+Goldin will fail with an error if the file(s) are not on an HFS/HFS+ volume
+.Pp
+Goldin lives here: https://github.com/packagesdev/goldin.
+.Sh SEE ALSO 
+.Xr SplitForks 1 , 
+.Xr FixupResourceForks 1 , 
+.Xr goldout 1 , 
+.Sh STANDARDS
+RFC 1740 documents AppleSingle/AppleDouble formats.

@@ -76,10 +76,13 @@ SUCH DAMAGE.
 #include <CoreServices/CoreServices.h>
 
 #include <unistd.h>
+#include <getopt.h>
 
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+
+#define GOLDIN_VERSION "0.0.7"
 
 long gMaxFileNameLength=0;
 Boolean gStripResourceForks=FALSE;
@@ -968,51 +971,85 @@ void SplitForksChildren(FSRef * inFileReferencePtr,FSRef * inParentReferencePtr)
 
 static void usage(const char * inProcessName)
 {
-	printf("usage: %s [-s][-v][-u] <file or directory>\n",inProcessName);
-	printf("       -s  --  Strip resource fork from source after splitting\n");
-	printf("       -v  --  Verbose mode\n");
-	printf("       -u  --  Show usage\n");
-	
-	exit(1);
+    printf("usage: %s [options] file ...\n",inProcessName);
+    printf("\n"\
+           "Options:\n"\
+           "  --help, -h           Show this usage guide\n"\
+           "  --verbose, -v        Verbose mode\n"\
+           "  --strip, -s          Strip resource fork from source after splitting\n"\
+           "  --version            Show the version of this tool\n"\
+           "\n");
 }
 
 int main (int argc, const char * argv[])
 {
-    char ch;
+    int c;
 	
-	while ((ch = getopt(argc, (char ** const) argv, "svu")) != -1)
-	{
-		switch (ch)
-		{
-			case 's':
-				/* Strip the resource fork */
-				
-				gStripResourceForks=TRUE;
-				break;
-			
-			case 'v':
-				/*Verbose */
-			
-				gVerboseMode=TRUE;
-				break;
-			case 'u':
-			case '?':
-			default:
-				usage(argv[0]);
-				break;
-		}
-	}
+    while (1)
+    {
+        static struct option tLongOptions[] =
+        {
+            {"help",                        no_argument,        NULL,    'h'},
+            {"verbose",                     no_argument,        NULL,    'v'},
+            {"strip",                       no_argument,        NULL,    's'},
+            {"version",                     no_argument,        NULL,    0},
+            
+            {0, 0, 0, 0}
+        };
+        
+        int tOptionIndex = 0;
+        
+        c = getopt_long (argc, (char **) argv, "vhs",tLongOptions, &tOptionIndex);
+        
+        /* Detect the end of the options. */
+        if (c == -1)
+            break;
+        
+        switch (c)
+        {
+            case 0:
+                
+                if (strncmp(tLongOptions[tOptionIndex].name,"version",strlen("version"))==0)
+                {
+                    printf("%s\n",GOLDIN_VERSION);
+                    
+                    exit(0);
+                }
+
+                break;
+                
+            case 's':
+                
+                gStripResourceForks=TRUE;
+                
+                break;
+                
+            case 'v':
+                
+                gVerboseMode=TRUE;
+                
+                break;
+
+            case 'h':
+            default:
+                usage(argv[0]);
+                
+                exit(0);
+                
+                break;
+        }
+    }
 	
 	argv+=optind;
     argc-=optind;
     
     if (argc != 1)
     {
-        if (argc==0)
-			logerror("No file or directory was specified\n");
-		else
-			logerror("Only one file or directory may be specified\n");
-		
+        if (argc==0) {
+            logerror("No file or directory was specified\n");
+    } else {
+            logerror("Only one file or directory may be specified\n");
+        }
 		return -1;
     }
 	else
